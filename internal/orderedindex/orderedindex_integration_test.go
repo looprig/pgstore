@@ -495,3 +495,78 @@ func TestListViewsIsolateNamespaceAndOrderingScope(t *testing.T) {
 		}
 	}
 }
+
+// TestListOrderedCrossesTheDecimalDigitBoundaryNumerically is the behavioural
+// guard for the acceptance order's numeric sort. It must hold twelve records:
+// the shared conformance case and the embedded-NUL case use five and four, so
+// neither crosses the 9 -> 10 decimal-digit-count change that separates a
+// numeric sort from a lexical one. Un-qualifying ORDER BY order_id lets the
+// order_id::text output column shadow the numeric table column, and the page
+// arrives as 1, 10, 11, 12, 2, ... — correct-looking at every smaller size.
+// The plan gate detects that mutation too, but only with -tags integration and
+// a DSN and only as an index-shape claim; the ordering is a correctness
+// property and is asserted here directly.
+func TestListOrderedCrossesTheDecimalDigitBoundaryNumerically(t *testing.T) {
+	store, _ := newIntegrationStore(t)
+	ctx := boundedContext(t)
+	const total = 12
+	for i := 1; i <= total; i++ {
+		id := storage.OrderedID{Namespace: "sessions", OrderingScope: "digit-boundary", StableKey: storage.StableKey(fmt.Sprintf("k%02d", i))}
+		if _, won, err := store.Create(ctx, id, "digit-workers", []byte(id.StableKey), storage.Rank{}, storage.Due{State: storage.NotDue}); err != nil || !won {
+			t.Fatalf("Create(%q) = %v, %v; want a created record", id.StableKey, won, err)
+		}
+	}
+
+	want := make([]uint64, 0, total)
+	for i := 1; i <= total; i++ {
+		want = append(want, uint64(i))
+	}
+
+	page, err := store.ListOrdered(ctx, "sessions", "digit-boundary", 0, total)
+	if err != nil {
+		t.Fatalf("ListOrdered single page: %v", err)
+	}
+	if got := recordOrders(page.Records); !equalOrders(got, want) {
+		t.Errorf("ListOrdered single-page acceptance order = %v, want numeric ascending %v", got, want)
+	}
+
+	// Paging across the boundary with a limit that lands mid-run proves the
+	// bound is compared numerically as well as sorted numerically: a lexical
+	// page would resume from the wrong NextAfterOrder.
+	var walked []uint64
+	var after uint64
+	for step := 0; step < total+1; step++ {
+		paged, err := store.ListOrdered(ctx, "sessions", "digit-boundary", after, 5)
+		if err != nil {
+			t.Fatalf("ListOrdered after %d: %v", after, err)
+		}
+		if len(paged.Records) == 0 {
+			break
+		}
+		walked = append(walked, recordOrders(paged.Records)...)
+		after = paged.NextAfterOrder
+	}
+	if !equalOrders(walked, want) {
+		t.Errorf("ListOrdered five-per-page walk = %v, want numeric ascending %v exactly once", walked, want)
+	}
+}
+
+func recordOrders(records []storage.OrderedRecord) []uint64 {
+	orders := make([]uint64, 0, len(records))
+	for _, record := range records {
+		orders = append(orders, record.Order)
+	}
+	return orders
+}
+
+func equalOrders(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
