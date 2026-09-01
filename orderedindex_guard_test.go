@@ -7,27 +7,72 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/looprig/pgstore/internal/orderedquery"
 )
 
-func TestOrderedIndexQueriesRemainIndexBackedKeysets(t *testing.T) {
-	implementation, err := os.ReadFile("internal/orderedindex/orderedindex.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	queries, err := os.ReadFile("internal/orderedquery/orderedquery.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := string(implementation) + "\n" + string(queries)
-	lower := strings.ToLower(source)
-	for _, forbidden := range []string{" offset ", "internal/kv", "sort.", "pg_advisory"} {
-		if strings.Contains(lower, forbidden) {
-			t.Errorf("OrderedIndex production source contains forbidden scan/fallback mechanism %q", forbidden)
+// The four OrderedIndex prohibitions — no OFFSET, no in-memory global sort, no
+// table scan, no fallback to another primitive — are classified by functions
+// over the parsed code, not by strings.Contains over the raw file. Substrings
+// were evadable in three of the four ways measured: "\nOFFSET 0" is not
+// " offset ", slices.SortFunc is not "sort.", a table-level fallback is not
+// "internal/kv", and a required ORDER BY fragment kept alive as a comment
+// satisfied a raw-source match while the live SQL had none.
+
+var orderedProductionPaths = []string{
+	"internal/orderedindex/orderedindex.go",
+	"internal/orderedquery/orderedquery.go",
+}
+
+func parseOrderedProduction(t *testing.T) []*ast.File {
+	t.Helper()
+	files := make([]*ast.File, 0, len(orderedProductionPaths))
+	for _, path := range orderedProductionPaths {
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
 		}
+		files = append(files, file)
 	}
+	return files
+}
+
+// orderedProductionStringLiterals is the only place SQL that reaches PostgreSQL
+// can live. Reading literals rather than raw source means text preserved in a
+// comment no longer satisfies a required fragment, and no longer hides a
+// forbidden one behind a line break.
+func orderedProductionStringLiterals(t *testing.T) []string {
+	t.Helper()
+	var literals []string
+	for _, file := range parseOrderedProduction(t) {
+		ast.Inspect(file, func(node ast.Node) bool {
+			literal, ok := node.(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				return true
+			}
+			value, err := strconv.Unquote(literal.Value)
+			if err != nil {
+				t.Errorf("unquote OrderedIndex string literal %s: %v", literal.Value, err)
+				return true
+			}
+			literals = append(literals, value)
+			return true
+		})
+	}
+	if len(literals) == 0 {
+		t.Fatal("no OrderedIndex string literals found; the literal derivation no longer matches production")
+	}
+	return literals
+}
+
+func TestOrderedIndexQueriesRemainIndexBackedKeysets(t *testing.T) {
+	t.Parallel()
+	joined := strings.Join(orderedProductionStringLiterals(t), "\n")
 	for _, required := range []string{
 		"order_id > $3::numeric",
 		"(rank_value, stable_key, ordering_scope) < ($3, $4, $5)",
@@ -35,9 +80,374 @@ func TestOrderedIndexQueriesRemainIndexBackedKeysets(t *testing.T) {
 		"ORDER BY rank_value DESC, stable_key DESC, ordering_scope DESC",
 		"ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC",
 	} {
-		if !strings.Contains(source, required) {
-			t.Errorf("OrderedIndex source lost required keyset fragment %q", required)
+		if !strings.Contains(joined, required) {
+			t.Errorf("OrderedIndex string literals lost required keyset fragment %q", required)
 		}
+	}
+}
+
+var offsetKeyword = regexp.MustCompile(`(?i)\boffset\b`)
+
+func TestOrderedIndexStatementsNeverSkipRowsWithOffset(t *testing.T) {
+	t.Parallel()
+	for _, literal := range orderedProductionStringLiterals(t) {
+		if offsetKeyword.MatchString(literal) {
+			t.Errorf("OrderedIndex statement literal %q uses OFFSET; a keyset page must bound its start, not count past rows", literal)
+		}
+	}
+}
+
+func TestOffsetClassifierReadsTheKeywordNotTheSpacing(t *testing.T) {
+	t.Parallel()
+	for _, forbidden := range []string{"LIMIT $4 OFFSET 0", "LIMIT $4\nOFFSET 0", "limit $4\toffset 0", "LIMIT $4\nOFFSET\n0"} {
+		if !offsetKeyword.MatchString(forbidden) {
+			t.Errorf("OFFSET classifier missed %q; the prohibition is on the keyword, not on one spelling of the whitespace around it", forbidden)
+		}
+	}
+	for _, allowed := range []string{"ORDER BY due_at ASC LIMIT $3", "SELECT offset_column FROM t", "SELECT byte_offset FROM t"} {
+		if offsetKeyword.MatchString(allowed) {
+			t.Errorf("OFFSET classifier rejected legal statement %q", allowed)
+		}
+	}
+}
+
+func TestOrderedIndexNeverSortsPagesInMemory(t *testing.T) {
+	t.Parallel()
+	for index, file := range parseOrderedProduction(t) {
+		path := orderedProductionPaths[index]
+		for _, spec := range file.Imports {
+			importPath, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				t.Fatalf("unquote import in %s: %v", path, err)
+			}
+			if importPath == "sort" || importPath == "slices" {
+				t.Errorf("%s imports %q; a page's order is the index's order and must not be re-established in the process", path, importPath)
+			}
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			name := callSelectorName(call)
+			if name == "" {
+				if identifier, ok := unparen(call.Fun).(*ast.Ident); ok {
+					name = identifier.Name
+				}
+			}
+			if strings.Contains(strings.ToLower(name), "sort") {
+				t.Errorf("%s calls %s; sorting records the database returned is a global in-memory sort however it is spelled", path, name)
+			}
+			return true
+		})
+	}
+}
+
+// migrationTableSuffixes derives every primitive's table name from the embedded
+// migrations, so a new primitive is denied without anyone extending a list.
+func migrationTableSuffixes(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("read migrations: %v", err)
+	}
+	placeholder := regexp.MustCompile(`\{\{([a-z_]+)\}\}`)
+	seen := make(map[string]bool)
+	var suffixes []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		source, err := os.ReadFile(filepath.Join("migrations", entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		for _, match := range placeholder.FindAllStringSubmatch(string(source), -1) {
+			if match[1] == "schema" || seen[match[1]] {
+				continue
+			}
+			seen[match[1]] = true
+			suffixes = append(suffixes, match[1])
+		}
+	}
+	if len(suffixes) == 0 {
+		t.Fatal("no migration table placeholders found; the suffix derivation no longer matches the migrations")
+	}
+	return suffixes
+}
+
+func TestOrderedIndexNeverFallsBackToAnotherPrimitive(t *testing.T) {
+	t.Parallel()
+	allowedInternal := map[string]bool{"guard": true, "orderedquery": true, "postgres": true}
+	for index, file := range parseOrderedProduction(t) {
+		path := orderedProductionPaths[index]
+		for _, spec := range file.Imports {
+			importPath, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				t.Fatalf("unquote import in %s: %v", path, err)
+			}
+			const prefix = "github.com/looprig/pgstore/internal/"
+			if !strings.HasPrefix(importPath, prefix) {
+				continue
+			}
+			if name := strings.TrimPrefix(importPath, prefix); !allowedInternal[name] {
+				t.Errorf("%s imports sibling primitive package %q; OrderedIndex has no fallback store", path, importPath)
+			}
+		}
+	}
+
+	// A package-path denial does not reach a fallback written at the table
+	// level, which needs no import at all: the ordered statements may name only
+	// the ordered tables.
+	var forbidden []string
+	for _, suffix := range migrationTableSuffixes(t) {
+		if !strings.HasPrefix(suffix, "ordered_") {
+			forbidden = append(forbidden, suffix)
+		}
+	}
+	if len(forbidden) == 0 {
+		t.Fatal("no non-ordered table suffixes derived; the fallback guard has no input")
+	}
+	literals := orderedProductionStringLiterals(t)
+	for _, suffix := range forbidden {
+		pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(suffix) + `\b`)
+		for _, literal := range literals {
+			if pattern.MatchString(literal) {
+				t.Errorf("OrderedIndex literal %q names the %q table of another primitive", literal, suffix)
+			}
+		}
+	}
+}
+
+type indexColumn struct {
+	name       string
+	descending bool
+}
+
+type declaredIndex struct {
+	name      string
+	columns   []indexColumn
+	predicate []string
+}
+
+func balancedParenthesis(text string, open int) (string, int) {
+	depth := 0
+	for i := open; i < len(text); i++ {
+		switch text[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return text[open+1 : i], i
+			}
+		}
+	}
+	return "", -1
+}
+
+func parseIndexColumns(list string) []indexColumn {
+	var columns []indexColumn
+	for _, item := range strings.Split(list, ",") {
+		fields := strings.Fields(item)
+		if len(fields) == 0 {
+			continue
+		}
+		name := fields[0]
+		if dot := strings.LastIndex(name, "."); dot >= 0 {
+			name = name[dot+1:]
+		}
+		columns = append(columns, indexColumn{
+			name:       strings.Trim(name, `"`),
+			descending: len(fields) > 1 && strings.EqualFold(fields[1], "DESC"),
+		})
+	}
+	return columns
+}
+
+var (
+	createIndexHeader = regexp.MustCompile(`(?is)CREATE\s+INDEX\s+([a-z_0-9]+)\s+ON\s+[^(]+`)
+	commentLine       = regexp.MustCompile(`(?m)--.*$`)
+	equalityPredicate = regexp.MustCompile(`([a-z_]+)\s*=\s*(\$\d+|\d+)\b`)
+)
+
+// declaredOrderedIndexes reads the physical access paths the ordered migration
+// actually creates. Deriving them means the coverage check below measures the
+// statements against the schema rather than against a copy of it.
+func declaredOrderedIndexes(t *testing.T) []declaredIndex {
+	t.Helper()
+	raw, err := os.ReadFile("migrations/0003_ordered_index.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := commentLine.ReplaceAllString(strings.NewReplacer("{{", "", "}}", "").Replace(string(raw)), "")
+	var indexes []declaredIndex
+	for _, statement := range strings.Split(source, ";") {
+		statement = strings.TrimSpace(statement)
+		switch {
+		case strings.HasPrefix(strings.ToUpper(statement), "CREATE TABLE"):
+			key := strings.Index(statement, "PRIMARY KEY")
+			if key < 0 {
+				continue
+			}
+			open := strings.Index(statement[key:], "(")
+			list, _ := balancedParenthesis(statement[key:], open)
+			indexes = append(indexes, declaredIndex{name: "primary key", columns: parseIndexColumns(list)})
+		case strings.HasPrefix(strings.ToUpper(statement), "CREATE INDEX"):
+			header := createIndexHeader.FindStringSubmatchIndex(statement)
+			if header == nil {
+				t.Fatalf("unreadable CREATE INDEX statement: %s", statement)
+			}
+			list, end := balancedParenthesis(statement, header[1])
+			if end < 0 {
+				t.Fatalf("unbalanced column list: %s", statement)
+			}
+			index := declaredIndex{name: statement[header[2]:header[3]], columns: parseIndexColumns(list)}
+			if where := strings.Index(strings.ToUpper(statement[end:]), "WHERE "); where >= 0 {
+				for _, conjunct := range strings.Split(statement[end+where+len("WHERE "):], " AND ") {
+					index.predicate = append(index.predicate, strings.Join(strings.Fields(conjunct), " "))
+				}
+			}
+			indexes = append(indexes, index)
+		}
+	}
+	if len(indexes) < 4 {
+		t.Fatalf("derived %d ordered indexes, want the primary key and three secondary indexes", len(indexes))
+	}
+	return indexes
+}
+
+// statementAccessPath is the shape a page statement asks the planner for: the
+// columns pinned to a constant, the residual predicate, and the total order.
+type statementAccessPath struct {
+	equality map[string]bool
+	where    string
+	orderBy  []indexColumn
+}
+
+func readAccessPath(sql string) (statementAccessPath, error) {
+	order := strings.Index(sql, " ORDER BY ")
+	if order < 0 {
+		return statementAccessPath{}, fmt.Errorf("statement has no ORDER BY, so its page order is not the database's")
+	}
+	where := strings.Index(sql, " WHERE ")
+	if where < 0 || where > order {
+		return statementAccessPath{}, fmt.Errorf("statement has no WHERE, so it reads the whole table")
+	}
+	predicate := strings.Join(strings.Fields(sql[where+len(" WHERE "):order]), " ")
+	trailing := sql[order+len(" ORDER BY "):]
+	if limit := strings.Index(trailing, " LIMIT "); limit >= 0 {
+		trailing = trailing[:limit]
+	}
+	path := statementAccessPath{equality: make(map[string]bool), where: predicate, orderBy: parseIndexColumns(trailing)}
+	for _, match := range equalityPredicate.FindAllStringSubmatch(predicate, -1) {
+		path.equality[match[1]] = true
+	}
+	if len(path.orderBy) == 0 {
+		return statementAccessPath{}, fmt.Errorf("statement has an empty ORDER BY")
+	}
+	return path, nil
+}
+
+// coveringIndex reports the declared index that answers the statement without a
+// sort: every leading index column the statement does not pin to a constant
+// must be exactly the next ordering column, in the same direction.
+func coveringIndex(indexes []declaredIndex, path statementAccessPath) (string, bool) {
+	for _, index := range indexes {
+		if !indexAnswers(index, path) {
+			continue
+		}
+		return index.name, true
+	}
+	return "", false
+}
+
+func indexAnswers(index declaredIndex, path statementAccessPath) bool {
+	for _, conjunct := range index.predicate {
+		if !strings.Contains(path.where, conjunct) {
+			return false
+		}
+	}
+	columns := index.columns
+	for len(columns) > 0 && path.equality[columns[0].name] {
+		columns = columns[1:]
+	}
+	if len(columns) < len(path.orderBy) {
+		return false
+	}
+	for i, want := range path.orderBy {
+		if columns[i] != want {
+			return false
+		}
+	}
+	return true
+}
+
+func orderedPageStatements() []struct {
+	name string
+	sql  string
+} {
+	const table = `"looprig"."p_ordered_records"`
+	return []struct {
+		name string
+		sql  string
+	}{
+		{"ordered first", orderedquery.Ordered(table, "sessions", "scope", 0, 25).SQL},
+		{"ordered middle", orderedquery.Ordered(table, "sessions", "scope", 500, 25).SQL},
+		{"ranked first", orderedquery.Ranked(table, "sessions", "workers", nil, 24).SQL},
+		{"ranked middle", orderedquery.Ranked(table, "sessions", "workers", &orderedquery.RankedPosition{}, 24).SQL},
+		{"due first", orderedquery.Due(table, "sessions", 999, nil, 24).SQL},
+		{"due middle", orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{}, 24).SQL},
+	}
+}
+
+// TestOrderedIndexPageStatementsAreCoveredByADeclaredIndex is the table-scan
+// prohibition, which previously had no database-free guard at all: it existed
+// only as the integration plan gate, which needs -tags integration and a DSN.
+// It does not replace the plan gate — only PostgreSQL can say which index it
+// chose — but it holds the property that an index capable of answering each
+// page without a sort is declared, and that the statement asks for it.
+func TestOrderedIndexPageStatementsAreCoveredByADeclaredIndex(t *testing.T) {
+	t.Parallel()
+	indexes := declaredOrderedIndexes(t)
+	for _, statement := range orderedPageStatements() {
+		path, err := readAccessPath(statement.sql)
+		if err != nil {
+			t.Errorf("%s: %v: %s", statement.name, err, statement.sql)
+			continue
+		}
+		name, ok := coveringIndex(indexes, path)
+		if !ok {
+			t.Errorf("%s has no declared index that answers it without a sort: %s", statement.name, statement.sql)
+			continue
+		}
+		t.Logf("%s is answered by index %q", statement.name, name)
+	}
+}
+
+func TestIndexCoverageClassifierRejectsUnbackedStatements(t *testing.T) {
+	t.Parallel()
+	indexes := declaredOrderedIndexes(t)
+	const columns = "namespace, ordering_scope, stable_key"
+	const table = `"looprig"."p_ordered_records"`
+	for _, test := range []struct{ name, sql string }{
+		{"no ORDER BY at all", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ordering_scope = $2 LIMIT $3"},
+		{"no WHERE at all", "SELECT " + columns + " FROM " + table + " ORDER BY " + table + ".order_id ASC, stable_key ASC LIMIT $3"},
+		{"ordering column is not indexed", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ordering_scope = $2 ORDER BY revision ASC LIMIT $3"},
+		{"scope no longer pinned", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 ORDER BY " + table + ".order_id ASC, stable_key ASC LIMIT $3"},
+		{"ranked direction reversed", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted ORDER BY rank_value ASC, stable_key ASC, ordering_scope ASC LIMIT $3"},
+		{"due partial-index predicate dropped", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND due_state = 1 ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT $3"},
+		{"ordering tail truncated to a non-key column", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted ORDER BY rank_value DESC, revision DESC LIMIT $3"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path, err := readAccessPath(test.sql)
+			if err != nil {
+				return
+			}
+			if name, ok := coveringIndex(indexes, path); ok {
+				t.Fatalf("coverage classifier accepted an unbacked statement against index %q: %s", name, test.sql)
+			}
+		})
 	}
 }
 
