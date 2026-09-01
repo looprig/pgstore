@@ -23,6 +23,16 @@ if test "${PGSTORE_MUTATION_RECOVER_ONLY:-}" = 1; then
 	exit 0
 fi
 
+# Preflight. The "local replace directive" mutation rewrites go.mod to point at
+# a sibling storage checkout; without one, module loading fails and the batch
+# aborts partway through, which reads as a broken mutation rather than a missing
+# prerequisite. Say so before any mutation runs.
+if ! test -f ../storage/go.mod; then
+	echo "prerequisite missing: ../storage/go.mod" >&2
+	echo "the 'local replace directive' mutation replaces github.com/looprig/storage with ../storage; run this script from a workspace that has the sibling storage repository checked out" >&2
+	exit 2
+fi
+
 mkdir -p "$snapshot_dir"
 for file in $files; do
 	mkdir -p "$snapshot_dir/$(dirname "$file")"
@@ -174,12 +184,32 @@ run_mutation "OrderedIndex.Create returns zero, true, nil" internal/orderedindex
 run_mutation "OrderedIndex.Delete returns zero, nil" internal/orderedindex/orderedindex.go 'return storage.OrderedRecord{}, guard.NotImplemented("OrderedIndex.Delete")' 'return storage.OrderedRecord{}, nil' TestSeamOperationsReturnNotImplemented 'does not call guard.NotImplemented'
 run_mutation "implemented KV.Get claims NotImplemented" internal/kv/kv.go 'return nil, 0, &storage.KeyNotFoundError{Key: key}' 'return nil, 0, guard.NotImplemented("KV.Get")' TestSeamOperationsReturnNotImplemented 'calls guard.NotImplemented although KV conformance runs'
 run_mutation "unskipped conformance without implementation" conformance_integration_test.go 't.Skip("P1.3 implements PostgreSQL leases")' '_ = 0' TestSeamOperationsReturnNotImplemented 'calls guard.NotImplemented although Leaser conformance runs'
+# The derivation must not be able to lose an input silently. Deleting the
+# interface assertion compiles, because Open still assigns the concrete store to
+# a storage.Leaser field, so nothing else notices; composed with a nil return it
+# would reinstate the exact defect the guard exists to prevent.
+run_mutation "seam derivation input deleted" internal/lease/lease.go 'var _ storage.Leaser = (*Store)(nil)' '' TestSeamOperationsReturnNotImplemented 'the seam derivation lost its input'
+run_mutation "seam derivation input deleted and Acquire returns nil, nil" internal/lease/lease.go 'return nil, guard.NotImplemented("Leaser.Acquire")
+}
+
+var _ storage.Leaser = (*Store)(nil)' 'return nil, nil
+}' TestSeamOperationsReturnNotImplemented 'the seam derivation lost its input'
 run_mutation "conformance entry point removed" conformance_integration_test.go 'func TestLeaserConformance' 'func LeaserConformanceRemoved' TestSeamOperationsReturnNotImplemented 'has no TestLeaserConformance entry point'
 
 # Identifier budget: PostgreSQL truncates past 63 bytes silently.
 run_mutation "oversized table suffix" internal/orderedindex/orderedindex.go 'var _ storage.OrderedIndex = (*Store)(nil)' 'var dueTable = func(tablePrefix string) string { return tablePrefix + "ordered_index_due_state_page" }
 
 var _ storage.OrderedIndex = (*Store)(nil)' TestTableSuffixesFitTheReservedIdentifierBudget 'over the 23-byte reserve'
+# Naming the suffix must not remove it from the budget.
+run_mutation "oversized table suffix named as a constant" internal/orderedindex/orderedindex.go 'var _ storage.OrderedIndex = (*Store)(nil)' 'const duePageSuffix = "ordered_index_due_state_page"
+
+func (s *Store) duePage() string { return s.tablePrefix + duePageSuffix }
+
+var _ storage.OrderedIndex = (*Store)(nil)' TestTableSuffixesFitTheReservedIdentifierBudget 'over the 23-byte reserve'
+# A suffix the derivation cannot read must be an error, not an omission.
+run_mutation "unbounded table suffix operand" internal/orderedindex/orderedindex.go 'var _ storage.OrderedIndex = (*Store)(nil)' 'func (s *Store) computed(part string) string { return s.tablePrefix + part }
+
+var _ storage.OrderedIndex = (*Store)(nil)' TestTableSuffixesFitTheReservedIdentifierBudget 'is not a string literal or a package-level string constant'
 
 # Both halves of the Ledger append authoritative reread.
 run_integration_mutation "absent record reported as success" internal/ledger/ledger.go 'return &storage.AmbiguousError{Name: name, Expected: expected, Cause: cause}' 'return nil' TestAppendReportsAmbiguousWhenTheRecordIsAbsentAfterAnUnknownCommit 'want *storage.AmbiguousError'

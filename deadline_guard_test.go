@@ -158,6 +158,18 @@ func TestSeamOperationsReturnNotImplemented(t *testing.T) {
 			}
 		}
 	}
+	// The loop above is packages-to-skips only. Without this second direction a
+	// deleted storage.X assertion silently removes a primitive from the derived
+	// set instead of failing: the package stops being checked, and the compiler
+	// does not miss the assertion because Open still assigns the concrete store
+	// to a storage.X field. Composed with an operation returning a nil or zero
+	// value, that is exactly the defect this test exists to prevent, passing
+	// green. An input the derivation cannot see must be an error, never a gap.
+	for _, primitive := range slices.Sorted(maps.Keys(skipped)) {
+		if _, ok := packages[primitive]; !ok {
+			t.Errorf("Test%sConformance exists but no internal package asserts storage.%s; the seam derivation lost its input", primitive, primitive)
+		}
+	}
 	if checked == 0 {
 		t.Fatal("no exported context-taking primitive methods found")
 	}

@@ -38,46 +38,37 @@ func TestKVKeysPinsBytewiseCollation(t *testing.T) {
 // combined with a maximum-length TablePrefix would not fail: two tables would
 // collide on one truncated name. Deriving the suffixes means a new primitive is
 // covered without anyone remembering to extend a list.
+//
+// The shapes the derivation understands are prefix + "literal" and
+// prefix + NamedConstant, where the constant is a package-level string constant
+// in the same directory. Any other right-hand operand is an error rather than a
+// silent omission: a suffix this test cannot read is a suffix it cannot bound.
 func TestTableSuffixesFitTheReservedIdentifierBudget(t *testing.T) {
 	t.Parallel()
 
+	paths := productionGoFiles(t)
+	constants := stringConstantsByDirectory(t, paths)
 	suffixes := make(map[string]string)
-	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() && entry.Name() == ".git" {
-			return filepath.SkipDir
-		}
-		if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
+	for _, path := range paths {
 		fileSet := token.NewFileSet()
 		file, err := parser.ParseFile(fileSet, path, nil, 0)
 		if err != nil {
-			return err
+			t.Fatalf("parse %s: %v", path, err)
 		}
 		ast.Inspect(file, func(node ast.Node) bool {
 			binary, ok := node.(*ast.BinaryExpr)
 			if !ok || binary.Op != token.ADD || !isTablePrefixExpression(binary.X) {
 				return true
 			}
-			literal, ok := binary.Y.(*ast.BasicLit)
-			if !ok || literal.Kind != token.STRING {
+			where := path + ":" + strconv.Itoa(fileSet.Position(binary.Pos()).Line)
+			suffix, ok := resolveStringOperand(binary.Y, constants[filepath.Dir(path)])
+			if !ok {
+				t.Errorf("%s: table suffix operand is not a string literal or a package-level string constant, so its length cannot be bounded here", where)
 				return true
 			}
-			value, unquoteErr := strconv.Unquote(literal.Value)
-			if unquoteErr != nil {
-				return true
-			}
-			position := fileSet.Position(literal.Pos())
-			suffixes[value] = path + ":" + strconv.Itoa(position.Line)
+			suffixes[suffix] = where
 			return true
 		})
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk production files: %v", err)
 	}
 	if len(suffixes) < 4 {
 		t.Fatalf("found %d table suffixes (%v); the derivation pattern no longer matches production source", len(suffixes), suffixes)
@@ -90,6 +81,88 @@ func TestTableSuffixesFitTheReservedIdentifierBudget(t *testing.T) {
 	if maxTablePrefixBytes+maxTableSuffixBytes != maxPostgresIdentifierBytes {
 		t.Fatalf("prefix budget %d plus suffix reserve %d must equal the %d-byte PostgreSQL identifier limit", maxTablePrefixBytes, maxTableSuffixBytes, maxPostgresIdentifierBytes)
 	}
+}
+
+// resolveStringOperand reads a suffix written either inline or as a named
+// constant. Naming the constant must not remove it from the budget.
+func resolveStringOperand(expression ast.Expr, constants map[string]string) (string, bool) {
+	switch operand := expression.(type) {
+	case *ast.BasicLit:
+		if operand.Kind != token.STRING {
+			return "", false
+		}
+		value, err := strconv.Unquote(operand.Value)
+		return value, err == nil
+	case *ast.Ident:
+		value, ok := constants[operand.Name]
+		return value, ok
+	}
+	return "", false
+}
+
+// stringConstantsByDirectory collects package-level string constants per
+// package directory, so a suffix constant declared in one file of a package is
+// resolvable from every other file in it.
+func stringConstantsByDirectory(t *testing.T, paths []string) map[string]map[string]string {
+	t.Helper()
+	constants := make(map[string]map[string]string)
+	for _, path := range paths {
+		fileSet := token.NewFileSet()
+		file, err := parser.ParseFile(fileSet, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		directory := filepath.Dir(path)
+		for _, declaration := range file.Decls {
+			general, ok := declaration.(*ast.GenDecl)
+			if !ok || general.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range general.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok || len(value.Names) != 1 || len(value.Values) != 1 {
+					continue
+				}
+				literal, ok := value.Values[0].(*ast.BasicLit)
+				if !ok || literal.Kind != token.STRING {
+					continue
+				}
+				unquoted, err := strconv.Unquote(literal.Value)
+				if err != nil {
+					continue
+				}
+				if constants[directory] == nil {
+					constants[directory] = make(map[string]string)
+				}
+				constants[directory][value.Names[0].Name] = unquoted
+			}
+		}
+	}
+	return constants
+}
+
+func productionGoFiles(t *testing.T) []string {
+	t.Helper()
+	var paths []string
+	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() && entry.Name() == ".git" {
+			return filepath.SkipDir
+		}
+		if !entry.IsDir() && strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go") {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk production files: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no production Go files found")
+	}
+	return paths
 }
 
 // isTablePrefixExpression reports the validated table-prefix operand in both
