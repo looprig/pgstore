@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -106,7 +107,13 @@ func TestPlanGateStatementOwnershipAllowsLegalFormatting(t *testing.T) {
 	legalLoop := `for _, test := range (orderedPlanCases(
 		table, prefix,
 	)) {
-		(tx).QueryRow(ctx, ("EXPLAIN "+((test.statement.SQL))), ((test.statement.Args))...)
+		var raw []byte
+		_ = ((tx).QueryRow(ctx, ("EXPLAIN  (ANALYZE, BUFFERS, FORMAT JSON)\n"+((test.statement.SQL))), ((test.statement.Args))...)).Scan((&raw))
+		var plan any
+		_ = json.Unmarshal((raw), (&plan))
+		if !planUsesIndex((plan), test.indexName) || planHasNodeType((plan), "Sort") || planHasNodeType(plan, "Incremental Sort") {
+			panic("plan")
+		}
 	}`
 	if err := validatePlanGateStatementOwnership([]byte(planOwnershipFixtureWithLoop(entries, "", legalLoop))); err != nil {
 		t.Fatalf("ownership validation rejected legal formatting: %v", err)
@@ -124,7 +131,14 @@ func TestPlanGateOwnershipBindsTheActuallyExplainedCaseSource(t *testing.T) {
 	}
 	t.Run("dead helper and live copied table", func(t *testing.T) {
 		deadTableLiveCopy := planOwnershipFixtureWithLoop(deadEntries, "", `live := []orderedPlanCase{{statement: orderedquery.Statement{SQL: "SELECT copied"}}}
-	for _, test := range live { tx.QueryRow(ctx, "EXPLAIN "+test.statement.SQL, test.statement.Args...) }`)
+	for _, test := range live {
+		var raw []byte
+		tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
+		var plan any
+		json.Unmarshal(raw, &plan)
+		_ = planUsesIndex(plan, test.indexName)
+		_ = planHasNodeType(plan, "Sort")
+	}`)
 		if err := validatePlanGateStatementOwnership([]byte(deadTableLiveCopy)); err == nil {
 			t.Fatal("ownership validation accepted a dead valid helper while the live EXPLAIN loop consumed copied SQL")
 		}
@@ -143,7 +157,12 @@ func TestPlanGateOwnershipBindsTheActuallyExplainedCaseSource(t *testing.T) {
 		}
 	}
 	for _, test := range orderedPlanCases(table, prefix) {
-		tx.QueryRow(ctx, "EXPLAIN "+test.statement.SQL, test.statement.Args...)
+		var raw []byte
+		tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
+		var plan any
+		json.Unmarshal(raw, &plan)
+		_ = planUsesIndex(plan, test.indexName)
+		_ = planHasNodeType(plan, "Sort")
 	}`
 		if err := validatePlanGateStatementOwnership([]byte(planOwnershipFixtureWithLoop(deadEntries, "", shadow))); err == nil {
 			t.Fatal("ownership validation accepted a same-name local shadow supplying copied live cases")
@@ -155,6 +174,116 @@ func TestPlanGateOwnershipBindsTheActuallyExplainedCaseSource(t *testing.T) {
 			t.Fatal("ownership validation classified a typed nil ranked cursor as a middle page")
 		}
 	})
+}
+
+// TestPlanGateOwnershipRejectsEveryExecutionSpellingAndUnboundAssertions covers
+// the escape the previous single-name match left open: the guard collected
+// calls literally named QueryRow, so a dead mandated QueryRow beside a live
+// Query, Exec or SendBatch decoy satisfied it while a copied statement supplied
+// the plan that was actually asserted.
+func TestPlanGateOwnershipRejectsEveryExecutionSpellingAndUnboundAssertions(t *testing.T) {
+	entries := []string{
+		`{family: orderedPlanOrder, page: orderedPlanFirst, statement: orderedquery.Ordered(table, "sessions", "scope", 0, 25)}`,
+		`{family: orderedPlanOrder, page: orderedPlanMiddle, statement: orderedquery.Ordered(table, "sessions", "scope", 500, 25)}`,
+		`{family: orderedPlanRanked, page: orderedPlanFirst, statement: orderedquery.Ranked(table, "sessions", "rank", nil, 24)}`,
+		`{family: orderedPlanRanked, page: orderedPlanMiddle, statement: orderedquery.Ranked(table, "sessions", "rank", &orderedquery.RankedPosition{}, 24)}`,
+		`{family: orderedPlanDue, page: orderedPlanFirst, statement: orderedquery.Due(table, "sessions", 999, nil, 24)}`,
+		`{family: orderedPlanDue, page: orderedPlanMiddle, statement: orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{}, 24)}`,
+	}
+	const tail = `var plan any
+		json.Unmarshal(raw, &plan)
+		_ = planUsesIndex(plan, test.indexName)
+		_ = planHasNodeType(plan, "Sort")`
+	loop := func(body string) string {
+		return "for _, test := range orderedPlanCases(table, prefix) {\n\t\tvar raw []byte\n\t\t" + body + "\n\t}"
+	}
+	tests := []struct {
+		name string
+		loop string
+	}{
+		{
+			name: "dead QueryRow beside live Query decoy",
+			loop: loop(`if false {
+			tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...)
+		}
+		rows, _ := tx.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT copied lookalike")
+		rows.Scan(&raw)
+		` + tail),
+		},
+		{
+			name: "live Exec decoy beside the mandated QueryRow",
+			loop: loop(`tx.Exec(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT copied lookalike")
+		tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
+		` + tail),
+		},
+		{
+			name: "live SendBatch decoy beside the mandated QueryRow",
+			loop: loop(`tx.SendBatch(ctx, batch)
+		tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
+		` + tail),
+		},
+		{
+			name: "Scan not bound to the mandated QueryRow",
+			loop: loop(`tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...)
+		cached.Scan(&raw)
+		` + tail),
+		},
+		{
+			name: "decoded plan is not the scanned bytes",
+			loop: loop(`tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
+		var plan any
+		json.Unmarshal(cachedBytes, &plan)
+		_ = planUsesIndex(plan, test.indexName)
+		_ = planHasNodeType(plan, "Sort")`),
+		},
+		{
+			name: "index assertion reads another plan",
+			loop: loop(`tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
+		var plan any
+		json.Unmarshal(raw, &plan)
+		_ = planUsesIndex(cachedPlan, test.indexName)
+		_ = planHasNodeType(plan, "Sort")`),
+		},
+		{
+			name: "downgraded EXPLAIN never executes the statement",
+			loop: loop(`tx.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
+		` + tail),
+		},
+		{
+			name: "row-returning decoy hoisted out of the range",
+			loop: `hoisted, _ := admin.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT copied lookalike")
+	_ = hoisted
+	` + loop(`tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
+		`+tail),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validatePlanGateStatementOwnership([]byte(planOwnershipFixtureWithLoop(entries, "", test.loop))); err == nil {
+				t.Fatal("ownership validation accepted an unbound assertion or a non-QueryRow execution spelling")
+			}
+		})
+	}
+}
+
+// TestProductionOwnershipRejectsEveryExecutionSpelling is the production-side
+// sibling of the same blindness: methodCallsNamed(body, "Query") could not see a
+// live QueryRow, Exec or SendBatch standing beside the mandated Query.
+func TestProductionOwnershipRejectsEveryExecutionSpelling(t *testing.T) {
+	ordered := `q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`
+	due := `q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`
+	for _, test := range []struct{ name, ranked string }{
+		{name: "live QueryRow decoy", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); s.pool.QueryRow(ctx, "SELECT copied").Scan(&sink); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
+		{name: "live Exec decoy", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); s.pool.Exec(ctx, "SELECT copied"); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
+		{name: "live SendBatch decoy", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); s.pool.SendBatch(ctx, batch); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
+		{name: "statement read through QueryRow instead of Query", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); s.pool.QueryRow(ctx, q.SQL, q.Args...).Scan(&sink)`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateProductionStatementOwnership([]byte(productionOwnershipFixture(ordered, test.ranked, due))); err == nil {
+				t.Fatal("production ownership accepted an extra or substituted execution spelling")
+			}
+		})
+	}
 }
 
 func TestProductionStatementOwnershipRequiresConsumedDirectBuilders(t *testing.T) {
@@ -229,10 +358,17 @@ func replaceEntry(entries []string, index int, replacement string) []string {
 	return result
 }
 
+const mandatedPlanLoop = `for _, test := range orderedPlanCases(table, prefix) {
+		var raw []byte
+		tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
+		var plan any
+		json.Unmarshal(raw, &plan)
+		_ = planUsesIndex(plan, test.indexName)
+		_ = planHasNodeType(plan, "Sort")
+	}`
+
 func planOwnershipFixture(entries []string, extra string) string {
-	return planOwnershipFixtureWithLoop(entries, extra, `for _, test := range orderedPlanCases(table, prefix) {
-		tx.QueryRow(ctx, "EXPLAIN "+test.statement.SQL, test.statement.Args...)
-	}`)
+	return planOwnershipFixtureWithLoop(entries, extra, mandatedPlanLoop)
 }
 
 func planOwnershipFixtureWithLoop(entries []string, extra, loop string) string {
@@ -446,24 +582,27 @@ func validatePlanIntegrationLoop(file *ast.File, casesHelper *ast.FuncDecl) erro
 	if !ok || rangeValue.Name == "_" {
 		return fmt.Errorf("orderedPlanCases range must bind its case value")
 	}
-	var queryRows []*ast.CallExpr
-	ast.Inspect(test.Body, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
+	// Nothing outside the ranged body may return rows. A hoisted decoy read is
+	// otherwise free to fill the variable the plan assertions consume.
+	for _, call := range executionCallsIn(test.Body) {
+		if nodeContains(ranges[0].Body, call) {
+			continue
 		}
-		selector, ok := unparen(call.Fun).(*ast.SelectorExpr)
-		if ok && selector.Sel.Name == "QueryRow" {
-			queryRows = append(queryRows, call)
+		if rowReturningMethods[callSelectorName(call)] {
+			return fmt.Errorf("plan integration test performs a row-returning %s outside the orderedPlanCases range", callSelectorName(call))
 		}
-		return true
-	})
-	if len(queryRows) != 1 {
-		return fmt.Errorf("plan integration test has %d QueryRow calls, want exactly 1", len(queryRows))
 	}
-	query := queryRows[0]
-	if !nodeContains(ranges[0].Body, query) {
-		return fmt.Errorf("plan integration QueryRow is not inside the orderedPlanCases range")
+	// Inside the ranged body the mandated statement is the only thing that may
+	// reach the database at all. Naming QueryRow alone made the guard exactly
+	// as strong as the last spelling someone thought of: a dead QueryRow beside
+	// a live Query, Exec or SendBatch passed it.
+	executions := executionCallsIn(ranges[0].Body)
+	if len(executions) != 1 {
+		return fmt.Errorf("orderedPlanCases range body has %d database execution calls (%s), want exactly the one mandated QueryRow", len(executions), strings.Join(executionCallNames(executions), ", "))
+	}
+	query := executions[0]
+	if callSelectorName(query) != "QueryRow" {
+		return fmt.Errorf("orderedPlanCases range body executes %s, want the mandated QueryRow", callSelectorName(query))
 	}
 	selector := unparen(query.Fun).(*ast.SelectorExpr)
 	queryReceiver, ok := unparen(selector.X).(*ast.Ident)
@@ -471,9 +610,133 @@ func validatePlanIntegrationLoop(file *ast.File, casesHelper *ast.FuncDecl) erro
 		return fmt.Errorf("plan integration QueryRow is not called on its BeginTx result")
 	}
 	if len(query.Args) != 3 || query.Ellipsis == token.NoPos || !isExplainStatement(query.Args[1], rangeValue) || !isNestedSelector(query.Args[2], rangeValue, "statement", "Args") {
-		return fmt.Errorf("plan integration QueryRow must explain the ranged case statement SQL with its variadic Args")
+		return fmt.Errorf("plan integration QueryRow must explain the ranged case statement SQL with EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) and its variadic Args")
+	}
+	return validatePlanAssertionChain(ranges[0].Body, query)
+}
+
+// validatePlanAssertionChain binds what is asserted to what was executed. The
+// mandated QueryRow being present is not the property under guard; the plan the
+// index assertions read having come from it is.
+func validatePlanAssertionChain(body *ast.BlockStmt, query *ast.CallExpr) error {
+	scans := selectorCallsNamed(body, "Scan")
+	if len(scans) != 1 {
+		return fmt.Errorf("orderedPlanCases range body has %d Scan calls, want exactly 1", len(scans))
+	}
+	scanSelector, ok := unparen(scans[0].Fun).(*ast.SelectorExpr)
+	if !ok || unparen(scanSelector.X) != ast.Expr(query) {
+		return fmt.Errorf("plan integration Scan is not called directly on the mandated QueryRow result")
+	}
+	if len(scans[0].Args) != 1 {
+		return fmt.Errorf("plan integration Scan takes %d destinations, want exactly 1", len(scans[0].Args))
+	}
+	raw, ok := addressedIdent(scans[0].Args[0])
+	if !ok {
+		return fmt.Errorf("plan integration Scan destination is not an addressed local variable")
+	}
+	decodes := packageCallsNamed(body, "json", "Unmarshal")
+	if len(decodes) != 1 || len(decodes[0].Args) != 2 {
+		return fmt.Errorf("orderedPlanCases range body has %d two-argument json.Unmarshal calls, want exactly 1", len(decodes))
+	}
+	source, ok := unparen(decodes[0].Args[0]).(*ast.Ident)
+	if !ok || !sameObject(source, raw) {
+		return fmt.Errorf("plan integration json.Unmarshal does not decode the scanned plan bytes")
+	}
+	plan, ok := addressedIdent(decodes[0].Args[1])
+	if !ok {
+		return fmt.Errorf("plan integration json.Unmarshal destination is not an addressed local variable")
+	}
+	for _, assertion := range []string{"planUsesIndex", "planHasNodeType"} {
+		calls := freeCallsNamed(body, assertion)
+		if len(calls) == 0 {
+			return fmt.Errorf("orderedPlanCases range body makes no %s assertion", assertion)
+		}
+		for _, call := range calls {
+			subject, ok := unparen(call.Args[0]).(*ast.Ident)
+			if len(call.Args) == 0 || !ok || !sameObject(subject, plan) {
+				return fmt.Errorf("%s does not assert over the decoded plan of the mandated QueryRow", assertion)
+			}
+		}
 	}
 	return nil
+}
+
+// executionMethods is the set of pgx entry points by which a statement can
+// reach the database, and rowReturningMethods the subset that can supply a
+// value an assertion later reads.
+var executionMethods = map[string]bool{
+	"Query": true, "QueryRow": true, "Exec": true, "SendBatch": true,
+	"CopyFrom": true, "Begin": true, "BeginTx": true, "BeginFunc": true,
+}
+
+var rowReturningMethods = map[string]bool{
+	"Query": true, "QueryRow": true, "SendBatch": true, "CopyFrom": true, "BeginFunc": true,
+}
+
+func executionCallsIn(root ast.Node) []*ast.CallExpr {
+	var calls []*ast.CallExpr
+	ast.Inspect(root, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if selector, ok := unparen(call.Fun).(*ast.SelectorExpr); ok && executionMethods[selector.Sel.Name] {
+			calls = append(calls, call)
+		}
+		return true
+	})
+	return calls
+}
+
+func executionCallNames(calls []*ast.CallExpr) []string {
+	names := make([]string, 0, len(calls))
+	for _, call := range calls {
+		names = append(names, callSelectorName(call))
+	}
+	return names
+}
+
+func callSelectorName(call *ast.CallExpr) string {
+	selector, ok := unparen(call.Fun).(*ast.SelectorExpr)
+	if !ok {
+		return ""
+	}
+	return selector.Sel.Name
+}
+
+func addressedIdent(expression ast.Expr) (*ast.Ident, bool) {
+	unary, ok := unparen(expression).(*ast.UnaryExpr)
+	if !ok || unary.Op != token.AND {
+		return nil, false
+	}
+	identifier, ok := unparen(unary.X).(*ast.Ident)
+	return identifier, ok
+}
+
+func packageCallsNamed(root ast.Node, packageName, name string) []*ast.CallExpr {
+	var calls []*ast.CallExpr
+	for _, call := range selectorCallsNamed(root, name) {
+		selector := unparen(call.Fun).(*ast.SelectorExpr)
+		if qualifier, ok := selectorPackage(selector); ok && qualifier == packageName {
+			calls = append(calls, call)
+		}
+	}
+	return calls
+}
+
+func freeCallsNamed(root ast.Node, name string) []*ast.CallExpr {
+	var calls []*ast.CallExpr
+	ast.Inspect(root, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if identifier, ok := unparen(call.Fun).(*ast.Ident); ok && identifier.Name == name {
+			calls = append(calls, call)
+		}
+		return true
+	})
+	return calls
 }
 
 func isSelectorCall(expression ast.Expr, method string) bool {
@@ -512,8 +775,23 @@ func isExplainStatement(expression ast.Expr, value *ast.Ident) bool {
 		return false
 	}
 	literal, ok := unparen(binary.X).(*ast.BasicLit)
-	return ok && literal.Kind == token.STRING && strings.Contains(literal.Value, "EXPLAIN") && isNestedSelector(binary.Y, value, "statement", "SQL")
+	if !ok || literal.Kind != token.STRING {
+		return false
+	}
+	text, err := strconv.Unquote(literal.Value)
+	if err != nil {
+		return false
+	}
+	// Task step 4 names this exact form. "EXPLAIN" as a substring also matches a
+	// downgrade to EXPLAIN (FORMAT JSON), which plans the statement without ever
+	// running it, so the plan gate would stop measuring real execution.
+	if !strings.HasPrefix(strings.Join(strings.Fields(text), " "), explainFlavour) {
+		return false
+	}
+	return isNestedSelector(binary.Y, value, "statement", "SQL")
 }
+
+const explainFlavour = "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)"
 
 func isNestedSelector(expression ast.Expr, root *ast.Ident, first, second string) bool {
 	outer, ok := unparen(expression).(*ast.SelectorExpr)
@@ -557,11 +835,14 @@ func validateProductionStatementOwnership(source []byte) error {
 		if len(statements) != 1 {
 			return fmt.Errorf("List%s has %d direct orderedquery.%s statement assignments, want exactly 1", family, len(statements), family)
 		}
-		queries := methodCallsNamed(function.Body, "Query")
-		if len(queries) != 1 {
-			return fmt.Errorf("List%s has %d Query calls, want exactly 1", family, len(queries))
+		executions := executionCallsIn(function.Body)
+		if len(executions) != 1 {
+			return fmt.Errorf("List%s has %d database execution calls (%s), want exactly one Query", family, len(executions), strings.Join(executionCallNames(executions), ", "))
 		}
-		query := queries[0]
+		query := executions[0]
+		if callSelectorName(query) != "Query" {
+			return fmt.Errorf("List%s executes %s, want the single pool Query that consumes its orderedquery statement", family, callSelectorName(query))
+		}
 		if !isReceiverPoolCall(query, receiver) || len(query.Args) != 3 || query.Ellipsis == token.NoPos ||
 			!isStatementSelector(query.Args[1], statements[0], "SQL") ||
 			!isStatementSelector(query.Args[2], statements[0], "Args") {
@@ -601,9 +882,9 @@ func isPointerToNamed(expression ast.Expr, name string) bool {
 	return ok && identifier.Name == name
 }
 
-func methodCallsNamed(body *ast.BlockStmt, method string) []*ast.CallExpr {
+func selectorCallsNamed(root ast.Node, method string) []*ast.CallExpr {
 	var calls []*ast.CallExpr
-	ast.Inspect(body, func(node ast.Node) bool {
+	ast.Inspect(root, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
 		if !ok {
 			return true
