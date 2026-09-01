@@ -129,6 +129,26 @@ func TestPlanGateOwnershipBindsTheActuallyExplainedCaseSource(t *testing.T) {
 			t.Fatal("ownership validation accepted a dead valid helper while the live EXPLAIN loop consumed copied SQL")
 		}
 	})
+	t.Run("same-name local shadow supplies copied live cases", func(t *testing.T) {
+		shadow := `orderedPlanCases := func(table, prefix string) []orderedPlanCase {
+		_ = table
+		_ = prefix
+		return []orderedPlanCase{
+			{statement: orderedquery.Statement{SQL: "SELECT copied order first"}},
+			{statement: orderedquery.Statement{SQL: "SELECT copied order middle"}},
+			{statement: orderedquery.Statement{SQL: "SELECT copied rank first"}},
+			{statement: orderedquery.Statement{SQL: "SELECT copied rank middle"}},
+			{statement: orderedquery.Statement{SQL: "SELECT copied due first"}},
+			{statement: orderedquery.Statement{SQL: "SELECT copied due middle"}},
+		}
+	}
+	for _, test := range orderedPlanCases(table, prefix) {
+		tx.QueryRow(ctx, "EXPLAIN "+test.statement.SQL, test.statement.Args...)
+	}`
+		if err := validatePlanGateStatementOwnership([]byte(planOwnershipFixtureWithLoop(deadEntries, "", shadow))); err == nil {
+			t.Fatal("ownership validation accepted a same-name local shadow supplying copied live cases")
+		}
+	})
 	t.Run("typed nil marked middle", func(t *testing.T) {
 		typedNilMiddle := replaceEntry(deadEntries, 3, `{family: orderedPlanRanked, page: orderedPlanMiddle, statement: orderedquery.Ranked(table, "sessions", "rank", (*orderedquery.RankedPosition)(nil), 24)}`)
 		if err := validatePlanGateStatementOwnership([]byte(planOwnershipFixture(typedNilMiddle, ""))); err == nil {
@@ -334,7 +354,7 @@ func validatePlanGateStatementOwnership(source []byte) error {
 			return fmt.Errorf("orderedquery.%s plan coverage = %d first/%d middle, want 1/1", family, got.first, got.middle)
 		}
 	}
-	return validatePlanIntegrationLoop(file)
+	return validatePlanIntegrationLoop(file, helpers[0])
 }
 
 func freeFunctionsNamed(file *ast.File, name string) []*ast.FuncDecl {
@@ -387,7 +407,10 @@ func keyedIdentifier(literal *ast.CompositeLit, field string) (string, error) {
 	return identifier.Name, nil
 }
 
-func validatePlanIntegrationLoop(file *ast.File) error {
+func validatePlanIntegrationLoop(file *ast.File, casesHelper *ast.FuncDecl) error {
+	if casesHelper.Name.Obj == nil || casesHelper.Name.Obj.Kind != ast.Fun || casesHelper.Name.Obj.Decl != casesHelper {
+		return fmt.Errorf("orderedPlanCases helper has no unique function declaration identity")
+	}
 	tests := freeFunctionsNamed(file, "TestOrderedIndexPlansUseExactKeysetIndexesForFirstAndMiddlePages")
 	if len(tests) != 1 {
 		return fmt.Errorf("found %d exact ordered-plan integration tests, want exactly 1", len(tests))
@@ -410,7 +433,7 @@ func validatePlanIntegrationLoop(file *ast.File) error {
 	var ranges []*ast.RangeStmt
 	ast.Inspect(test.Body, func(node ast.Node) bool {
 		rangeStatement, ok := node.(*ast.RangeStmt)
-		if !ok || !isIdentifierCall(rangeStatement.X, "orderedPlanCases") {
+		if !ok || !isHelperCall(rangeStatement.X, casesHelper) {
 			return true
 		}
 		ranges = append(ranges, rangeStatement)
@@ -462,13 +485,13 @@ func isSelectorCall(expression ast.Expr, method string) bool {
 	return ok && selector.Sel.Name == method
 }
 
-func isIdentifierCall(expression ast.Expr, name string) bool {
+func isHelperCall(expression ast.Expr, helper *ast.FuncDecl) bool {
 	call, ok := unparen(expression).(*ast.CallExpr)
 	if !ok {
 		return false
 	}
 	identifier, ok := unparen(call.Fun).(*ast.Ident)
-	return ok && identifier.Name == name
+	return ok && identifier.Obj != nil && identifier.Obj == helper.Name.Obj
 }
 
 func nodeContains(root ast.Node, target ast.Node) bool {

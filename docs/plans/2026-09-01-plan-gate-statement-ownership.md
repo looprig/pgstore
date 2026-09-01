@@ -4,7 +4,7 @@
 
 **Goal:** Make the ordered-index plan guard structurally prove that its six first/middle EXPLAIN cases directly consume the three production query builders.
 
-**Architecture:** Parse production and the plan integration test with Go's standard `go/parser`, but enforce only narrow explicit structures. Each `ListOrdered`, `ListRanked`, and `ListDue` method must have one `*Store` receiver, one direct family-builder assignment, and one receiver-bound `s.pool.Query` consuming that exact statement object. The integration test must range directly over the one `orderedPlanCases` helper and send that range value's statement to its sole `QueryRow`; the helper owns exactly six family/page-labelled direct builder calls whose metadata agrees with their true cursor semantics, including typed nil.
+**Architecture:** Parse production and the plan integration test with Go's standard `go/parser`, but enforce only narrow explicit structures. Each `ListOrdered`, `ListRanked`, and `ListDue` method must have one `*Store` receiver, one direct family-builder assignment, and one receiver-bound `s.pool.Query` consuming that exact statement object. The integration test must range directly over the unique `orderedPlanCases` declaration by AST object identity and send that range value's statement to its sole `QueryRow`; the helper owns exactly six family/page-labelled direct builder calls whose metadata agrees with their true cursor semantics, including typed nil.
 
 **Tech Stack:** Go 1.26 standard AST packages, Go tests, existing shell mutation runner.
 
@@ -29,8 +29,9 @@
 2. Require exactly one direct family-builder assignment and exactly one receiver-bound `pool.Query`; bind SQL and variadic Args to the assignment object.
 3. Extract the plan cases into `orderedPlanCases` and make the integration test range directly over that helper call.
 4. Require the test's sole `QueryRow` to consume the range object's statement and arguments.
-5. Validate exactly six helper cases with one first and one middle call per family; bind family/page metadata to builder arguments and recognize parenthesized typed nil as first.
-6. Preserve anti-vacuity and legal formatting behavior, then run the focused race tests.
+5. Bind the ranged callee to the validated free helper's declaration object, rejecting a same-name local shadow that supplies copied live cases.
+6. Validate exactly six helper cases with one first and one middle call per family; bind family/page metadata to builder arguments and recognize parenthesized typed nil as first.
+7. Preserve anti-vacuity and legal formatting behavior, then run the focused race tests.
 
 ### Task 3: Mutation and repository verification
 

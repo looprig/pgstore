@@ -268,6 +268,19 @@ run_mutation "ordered production receiver shadow" internal/orderedindex/orderedi
 run_mutation "ordered plan gate dead helper live copied table" orderedindex_plan_integration_test.go 'for _, test := range orderedPlanCases(table, prefix) {' '_ = orderedPlanCases(table, prefix)
 	tests := []orderedPlanCase{{name: "copied", family: orderedPlanOrder, page: orderedPlanFirst, indexName: prefix + "ordered_order_idx", statement: orderedquery.Statement{SQL: "SELECT 1"}, wantArgs: nil}}
 	for _, test := range tests {' TestOrderedIndexPlanGateUsesProductionStatements 'has 0 direct orderedPlanCases ranges, want exactly 1'
+run_integration_mutation "ordered plan gate same-name local shadow" orderedindex_plan_integration_test.go 'for _, test := range orderedPlanCases(table, prefix) {' 'deadOrderedPlanCases := orderedPlanCases
+	_ = deadOrderedPlanCases
+	orderedPlanCases := func(table, prefix string) []orderedPlanCase {
+		return []orderedPlanCase{
+			{name: "copied order first", family: orderedPlanOrder, page: orderedPlanFirst, indexName: prefix + "ordered_order_idx", statement: orderedquery.Statement{SQL: "SELECT 1"}},
+			{name: "copied order middle", family: orderedPlanOrder, page: orderedPlanMiddle, indexName: prefix + "ordered_order_idx", statement: orderedquery.Statement{SQL: "SELECT 1"}},
+			{name: "copied rank first", family: orderedPlanRanked, page: orderedPlanFirst, indexName: prefix + "ordered_rank_idx", statement: orderedquery.Statement{SQL: "SELECT 1"}},
+			{name: "copied rank middle", family: orderedPlanRanked, page: orderedPlanMiddle, indexName: prefix + "ordered_rank_idx", statement: orderedquery.Statement{SQL: "SELECT 1"}},
+			{name: "copied due first", family: orderedPlanDue, page: orderedPlanFirst, indexName: prefix + "ordered_due_idx", statement: orderedquery.Statement{SQL: "SELECT 1"}},
+			{name: "copied due middle", family: orderedPlanDue, page: orderedPlanMiddle, indexName: prefix + "ordered_due_idx", statement: orderedquery.Statement{SQL: "SELECT 1"}},
+		}
+	}
+	for _, test := range orderedPlanCases(table, prefix) {' TestOrderedIndexPlanGateUsesProductionStatements 'has 0 direct orderedPlanCases ranges, want exactly 1'
 run_mutation "ordered plan gate typed nil marked middle" orderedindex_plan_integration_test.go '&orderedquery.RankedPosition{Rank: 50, StableKey: []byte("key-000500"), OrderingScope: "scope-5"}' '(*orderedquery.RankedPosition)(nil)' TestOrderedIndexPlanGateUsesProductionStatements 'page metadata orderedPlanMiddle disagrees with its orderedPlanFirst cursor'
 run_integration_mutation "ordered get leaks bare password" internal/orderedindex/orderedindex.go 'return storage.OrderedRecord{}, failure(ctx, "ordered get")' 'return storage.OrderedRecord{}, pginternal.RedactedError("ordered get "+s.pool.Config().ConnConfig.Password)' TestOperationErrorsDoNotDiscloseDSNOrCredential 'OrderedIndex.Get error disclosed'
 run_integration_mutation "ordered create leaks bare password" internal/orderedindex/orderedindex.go 'return storage.OrderedRecord{}, false, failure(ctx, "ordered create lookup")' 'return storage.OrderedRecord{}, false, pginternal.RedactedError("ordered create "+s.pool.Config().ConnConfig.Password)' TestOperationErrorsDoNotDiscloseDSNOrCredential 'OrderedIndex.Create error disclosed'

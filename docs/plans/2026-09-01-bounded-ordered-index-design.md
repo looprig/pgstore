@@ -74,8 +74,10 @@ Its unit guard parses both call sites with Go's AST: each unique `*Store` listin
 must pass its one directly built family statement's SQL and variadic arguments to its
 one receiver-bound `Query`. The tagged integration test ranges directly over one helper
 that owns exactly six family/page-labelled first/middle builder calls, and its sole
-`QueryRow` must consume that range value on the transaction it opened. Family/page
-metadata is checked against the cursor argument, including typed nil. This structural
+`QueryRow` must consume that range value on the transaction it opened. The ranged
+callee is bound to that helper's declaration identity, so a same-name local function
+cannot substitute a copied live case table while leaving the validated helper dead. The
+family/page metadata is checked against the cursor argument, including typed nil. This structural
 check is insensitive to harmless formatting while copied SQL, unused/dead builders,
 decoy queries, receiver shadowing, duplicate methods, and an alternate live case table
 cannot satisfy statement ownership.
