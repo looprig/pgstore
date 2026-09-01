@@ -4,7 +4,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -231,30 +230,6 @@ func stringConstantsByDirectory(t *testing.T, paths []string) map[string]map[str
 		}
 	}
 	return constants
-}
-
-func productionGoFiles(t *testing.T) []string {
-	t.Helper()
-	var paths []string
-	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() && entry.Name() == ".git" {
-			return filepath.SkipDir
-		}
-		if !entry.IsDir() && strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go") {
-			paths = append(paths, path)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk production files: %v", err)
-	}
-	if len(paths) == 0 {
-		t.Fatal("no production Go files found")
-	}
-	return paths
 }
 
 // isTablePrefixExpression reports the validated table-prefix operand in both

@@ -2,6 +2,14 @@
 set -eu
 
 snapshot_dir="/private/tmp/pgstore-mutation-snapshot-${UID:-codex}"
+# Repository-owned scratch. Scoped to this run and removed on every exit path,
+# including an interrupt: a build cache left behind is this repository's litter,
+# not the operator's.
+cache_dir="/private/tmp/pgstore-gocache-$$"
+cleanup_scratch() {
+	rm -rf "$cache_dir"
+}
+trap 'cleanup_scratch' EXIT INT TERM
 files="go.mod options.go pgstore.go migrations.go migrations/0002_leases.sql migrations/0003_ordered_index.sql internal/guard/guard.go internal/postgres/postgres.go internal/ledger/ledger.go internal/lease/lease.go internal/kv/kv.go internal/orderedindex/orderedindex.go internal/orderedquery/orderedquery.go conformance_integration_test.go orderedindex_plan_integration_test.go"
 
 restore_snapshot() {
@@ -29,6 +37,21 @@ for file in $files; do
 	cp "$file" "$snapshot_dir/$file"
 done
 
+# Failure accounting. A single stale expectation used to abort the campaign,
+# which silently removed every mutation after it from the run: at HEAD~ that hid
+# 35 of them, including all four OrderedIndex credential-leak mutations. A
+# mutation that cannot be classified is now recorded and the campaign continues,
+# so one stale string costs one mutation and is reported beside every other
+# result instead of truncating the evidence.
+total=0
+killed=0
+failures=""
+
+record_failure() {
+	failures="$failures$1
+"
+}
+
 run_mutation() {
 	name=$1
 	file=$2
@@ -43,31 +66,37 @@ run_mutation() {
 	# The previous mutation is restored at the next iteration's entry. If this
 	# process is killed mid-test, the startup recovery above performs this step.
 	restore_snapshot
-	GOWORK=off GOCACHE=/private/tmp/pgstore-gocache go test -list "^${test_name}$" ./... | grep -qx "$test_name"
+	total=$((total + 1))
+	GOWORK=off GOCACHE="$cache_dir" go test -list "^${test_name}$" ./... | grep -qx "$test_name"
 	if ! grep -Fq "$old" "$file"; then
-		echo "mutation pattern not found: $name"
-		exit 1
+		echo "DRIFTED|$name|$test_name|mutation pattern no longer present in $file"
+		record_failure "DRIFTED|$name"
+		return
 	fi
 	MUT_OLD=$old MUT_NEW=$new perl -0pi -e 's/\Q$ENV{"MUT_OLD"}\E/$ENV{"MUT_NEW"}/' "$file"
 
 	set +e
-	output=$(GOWORK=off GOCACHE=/private/tmp/pgstore-gocache go test -run "^${test_name}$" -count=1 ./... 2>&1)
+	output=$(GOWORK=off GOCACHE="$cache_dir" go test -run "^${test_name}$" -count=1 ./... 2>&1)
 	status=$?
 	set -e
 	if test "$status" -eq 0; then
 		echo "SURVIVED|$name|$test_name|test passed"
-		exit 1
+		record_failure "SURVIVED|$name"
+		return
 	fi
 	if printf '%s\n' "$output" | grep -Eq '\[build failed\]|\[setup failed\]|undefined:|syntax error'; then
 		echo "INVALID|$name|$test_name|compile/setup failure"
 		printf '%s\n' "$output"
-		exit 1
+		record_failure "INVALID|$name"
+		return
 	fi
 	if ! printf '%s\n' "$output" | grep -Fq "$want"; then
 		echo "WRONG_FAILURE|$name|$test_name|missing: $want"
 		printf '%s\n' "$output"
-		exit 1
+		record_failure "WRONG_FAILURE|$name"
+		return
 	fi
+	killed=$((killed + 1))
 	echo "KILLED|$name|$test_name|$want"
 }
 
@@ -85,31 +114,37 @@ run_integration_mutation() {
 	restore_snapshot
 	PGSTORE_TEST_DSN=${PGSTORE_TEST_DSN:?PGSTORE_TEST_DSN is required for P1.2 mutations}
 	export PGSTORE_TEST_DSN
-	GOWORK=off GOCACHE=/private/tmp/pgstore-gocache go test -tags integration -list "^${test_name}$" ./... | grep -qx "$test_name"
+	total=$((total + 1))
+	GOWORK=off GOCACHE="$cache_dir" go test -tags integration -list "^${test_name}$" ./... | grep -qx "$test_name"
 	if ! grep -Fq "$old" "$file"; then
-		echo "mutation pattern not found: $name"
-		exit 1
+		echo "DRIFTED|$name|$test_name|mutation pattern no longer present in $file"
+		record_failure "DRIFTED|$name"
+		return
 	fi
 	MUT_OLD=$old MUT_NEW=$new perl -0pi -e 's/\Q$ENV{"MUT_OLD"}\E/$ENV{"MUT_NEW"}/' "$file"
 
 	set +e
-	output=$(GOWORK=off GOCACHE=/private/tmp/pgstore-gocache go test -tags integration -run "^${test_name}$" -count=1 ./... 2>&1)
+	output=$(GOWORK=off GOCACHE="$cache_dir" go test -tags integration -run "^${test_name}$" -count=1 ./... 2>&1)
 	status=$?
 	set -e
 	if test "$status" -eq 0; then
 		echo "SURVIVED|$name|$test_name|test passed"
-		exit 1
+		record_failure "SURVIVED|$name"
+		return
 	fi
 	if printf '%s\n' "$output" | grep -Eq '\[build failed\]|\[setup failed\]|undefined:|syntax error'; then
 		echo "INVALID|$name|$test_name|compile/setup failure"
 		printf '%s\n' "$output"
-		exit 1
+		record_failure "INVALID|$name"
+		return
 	fi
 	if ! printf '%s\n' "$output" | grep -Fq "$want"; then
 		echo "WRONG_FAILURE|$name|$test_name|missing: $want"
 		printf '%s\n' "$output"
-		exit 1
+		record_failure "WRONG_FAILURE|$name"
+		return
 	fi
+	killed=$((killed + 1))
 	echo "KILLED|$name|$test_name|$want"
 }
 
@@ -255,7 +290,7 @@ run_mutation "ordered plan gate copied due SQL" orderedindex_plan_integration_te
 run_mutation "ordered production dead second receiver query" internal/orderedindex/orderedindex.go 'statement := orderedquery.Ranked(s.recordsTable(), namespace, rankingScope, queryPosition, limit)
 	rows, err := s.pool.Query(ctx, statement.SQL, statement.Args...)' 'statement := orderedquery.Ranked(s.recordsTable(), namespace, rankingScope, queryPosition, limit)
 	if false { decoyRows, decoyErr := s.pool.Query(ctx, "SELECT 1"); if decoyErr == nil { decoyRows.Close() } }
-	rows, err := s.pool.Query(ctx, statement.SQL, statement.Args...)' TestOrderedIndexPlanGateUsesProductionStatements 'has 2 Query calls, want exactly 1'
+	rows, err := s.pool.Query(ctx, statement.SQL, statement.Args...)' TestOrderedIndexPlanGateUsesProductionStatements 'The page must come from the one orderedquery statement, so exactly one Query is allowed.'
 run_mutation "ordered production copied live query with unused builder" internal/orderedindex/orderedindex.go 'statement := orderedquery.Ranked(s.recordsTable(), namespace, rankingScope, queryPosition, limit)
 	rows, err := s.pool.Query(ctx, statement.SQL, statement.Args...)' 'statement := orderedquery.Ranked(s.recordsTable(), namespace, rankingScope, queryPosition, limit)
 	_ = statement
@@ -347,3 +382,16 @@ run_integration_mutation "migration failure leaks DSN" migrations.go 'return pgi
 
 restore_snapshot
 rm -rf "$snapshot_dir"
+cleanup_scratch
+
+echo "TOTAL=$total KILLED=$killed"
+if test -n "$failures"; then
+	echo "UNKILLED MUTATIONS:"
+	printf '%s' "$failures"
+	exit 1
+fi
+if test -z "${PGSTORE_MUTATION_FILTER:-}" && test "$total" -ne "${PGSTORE_MUTATION_EXPECTED_TOTAL:-155}"; then
+	echo "campaign ran $total mutations, want ${PGSTORE_MUTATION_EXPECTED_TOTAL:-155}: entries cannot be lost silently"
+	exit 1
+fi
+echo "ALL $killed MUTATIONS KILLED"

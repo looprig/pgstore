@@ -78,7 +78,8 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, schema, prefix string, mod
 		if parseErr != nil || n <= version {
 			continue
 		}
-		// COVERAGE NOTE: still unreachable by any input, and still uncovered.
+		// COVERAGE NOTE (also indexed in docs/FOLLOWUPS.md): still unreachable
+		// by any input, and still uncovered.
 		// The embedded set is 0001, 0002, 0003 — consecutive — and the loop
 		// body runs only for n > version, so n is always version+1. The
 		// versions this branch could see are bounded above by the

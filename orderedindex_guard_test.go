@@ -3,11 +3,12 @@ package pgstore
 import (
 	"fmt"
 	"go/ast"
-	"go/constant"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -111,35 +112,90 @@ func TestOffsetClassifierReadsTheKeywordNotTheSpacing(t *testing.T) {
 	}
 }
 
+// reorderingFunctions are the standard-library entry points that reorder a
+// slice in place but whose names do not say so: sort.Slice, sort.Stable and
+// sort.Strings all reorder, and none of them contains "sort" in the identifier
+// a name-only classifier reads.
+var reorderingFunctions = map[string]map[string]bool{
+	"sort":   {"Slice": true, "SliceStable": true, "Sort": true, "Stable": true, "Strings": true, "Ints": true, "Float64s": true},
+	"slices": {"Sort": true, "SortFunc": true, "SortStableFunc": true, "SortStable": true},
+}
+
+// sortednessChecks read an order without establishing one, so they are not
+// sorting entry points even though their names contain the word.
+var sortednessChecks = map[string]bool{
+	"IsSorted": true, "IsSortedFunc": true, "SliceIsSorted": true,
+	"StringsAreSorted": true, "IntsAreSorted": true, "Float64sAreSorted": true,
+}
+
+// sortingEntryPoint classifies a call by the operation it performs. An earlier
+// revision banned the sort and slices imports wholesale, which also denied
+// slices.Contains, slices.Clone and sort.SearchInts — none of which reorder
+// anything.
+func sortingEntryPoint(qualifier, name string) bool {
+	if reorderingFunctions[qualifier][name] {
+		return true
+	}
+	if sortednessChecks[name] {
+		return false
+	}
+	return strings.Contains(strings.ToLower(name), "sort")
+}
+
+// TestOrderedIndexNeverSortsPagesInMemory is a named-entry-point guard, and its
+// reach is exactly that: it catches sort.Slice, slices.SortFunc and a helper
+// called sortRecords, and it does not catch an unnamed comparison loop written
+// inline. The DB-free coverage guard and the integration plan gate cannot catch
+// that either — both read only SQL, and neither can observe Go-side reordering.
+// Measured: an inline insertion reorder in ListRanked that inverts the page
+// passes this guard, the DB-free suite, the integration plan gate and the
+// internal/orderedindex integration package. What kills it is the Storage
+// conformance ordering suite with a database — specifically
+// TestOrderedIndexConformance/TestOrderedIndexListRankedPagesByRankAndStableKey
+// — and only because the reordered page differs from the database's.
 func TestOrderedIndexNeverSortsPagesInMemory(t *testing.T) {
 	t.Parallel()
 	for index, file := range parseOrderedProduction(t) {
 		path := orderedProductionPaths[index]
-		for _, spec := range file.Imports {
-			importPath, err := strconv.Unquote(spec.Path.Value)
-			if err != nil {
-				t.Fatalf("unquote import in %s: %v", path, err)
-			}
-			if importPath == "sort" || importPath == "slices" {
-				t.Errorf("%s imports %q; a page's order is the index's order and must not be re-established in the process", path, importPath)
-			}
-		}
 		ast.Inspect(file, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
 			if !ok {
 				return true
 			}
+			qualifier := ""
 			name := callSelectorName(call)
-			if name == "" {
-				if identifier, ok := unparen(call.Fun).(*ast.Ident); ok {
-					name = identifier.Name
-				}
+			if selector, ok := unparen(call.Fun).(*ast.SelectorExpr); ok {
+				qualifier, _ = selectorPackage(selector)
+			} else if identifier, ok := unparen(call.Fun).(*ast.Ident); ok {
+				name = identifier.Name
 			}
-			if strings.Contains(strings.ToLower(name), "sort") {
-				t.Errorf("%s calls %s; sorting records the database returned is a global in-memory sort however it is spelled", path, name)
+			if sortingEntryPoint(qualifier, name) {
+				t.Errorf("%s calls %s; the page order is the index's order, and re-establishing it in the process makes the ordering unverifiable from the SQL", path, name)
 			}
 			return true
 		})
+	}
+}
+
+func TestSortingEntryPointClassifierReadsTheOperationNotThePackage(t *testing.T) {
+	t.Parallel()
+	for _, forbidden := range []struct{ qualifier, name string }{
+		{"sort", "Slice"}, {"sort", "SliceStable"}, {"sort", "Sort"}, {"sort", "Stable"}, {"sort", "Strings"},
+		{"slices", "Sort"}, {"slices", "SortFunc"}, {"slices", "SortStableFunc"},
+		{"", "sortRecords"}, {"", "insertionSortByRank"}, {"pager", "SortPage"},
+	} {
+		if !sortingEntryPoint(forbidden.qualifier, forbidden.name) {
+			t.Errorf("sorting classifier missed %s.%s", forbidden.qualifier, forbidden.name)
+		}
+	}
+	for _, allowed := range []struct{ qualifier, name string }{
+		{"slices", "Contains"}, {"slices", "Clone"}, {"slices", "Equal"}, {"slices", "BinarySearch"},
+		{"sort", "SearchInts"}, {"sort", "Search"}, {"sort", "SliceIsSorted"},
+		{"bytes", "Clone"}, {"strings", "Fields"}, {"", "scanRecords"},
+	} {
+		if sortingEntryPoint(allowed.qualifier, allowed.name) {
+			t.Errorf("sorting classifier denied %s.%s, which reorders nothing", allowed.qualifier, allowed.name)
+		}
 	}
 }
 
@@ -176,9 +232,60 @@ func migrationTableSuffixes(t *testing.T) []string {
 	return suffixes
 }
 
+// packagesOwningMigrationTables derives which internal package owns each table
+// the migrations create, by finding the package whose production source names
+// the table suffix. Deriving the denied set inverts a hand-written allowlist:
+// widening an allowlist by one name is invisible, whereas a package that owns a
+// migration table is denied by construction the moment it exists.
+func packagesOwningMigrationTables(t *testing.T) map[string]string {
+	t.Helper()
+	suffixes := migrationTableSuffixes(t)
+	owners := make(map[string]string)
+	for _, path := range productionGoFiles(t) {
+		directory := filepath.Dir(path)
+		if !strings.HasPrefix(directory, "internal"+string(filepath.Separator)) {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			literal, ok := node.(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				return true
+			}
+			value, err := strconv.Unquote(literal.Value)
+			if err != nil {
+				return true
+			}
+			for _, suffix := range suffixes {
+				if value == suffix {
+					owners[filepath.Base(directory)] = suffix
+				}
+			}
+			return true
+		})
+	}
+	if len(owners) < 4 {
+		t.Fatalf("derived %d packages owning migration tables (%v); the ownership derivation no longer matches production", len(owners), owners)
+	}
+	return owners
+}
+
 func TestOrderedIndexNeverFallsBackToAnotherPrimitive(t *testing.T) {
 	t.Parallel()
-	allowedInternal := map[string]bool{"guard": true, "orderedquery": true, "postgres": true}
+	owners := packagesOwningMigrationTables(t)
+	denied := make(map[string]string)
+	for pkg, suffix := range owners {
+		if !strings.HasPrefix(suffix, "ordered_") {
+			denied[pkg] = suffix
+		}
+	}
+	if len(denied) < 3 {
+		t.Fatalf("derived %d sibling primitive packages (%v); the fallback guard has no input", len(denied), denied)
+	}
+
 	for index, file := range parseOrderedProduction(t) {
 		path := orderedProductionPaths[index]
 		for _, spec := range file.Imports {
@@ -190,8 +297,8 @@ func TestOrderedIndexNeverFallsBackToAnotherPrimitive(t *testing.T) {
 			if !strings.HasPrefix(importPath, prefix) {
 				continue
 			}
-			if name := strings.TrimPrefix(importPath, prefix); !allowedInternal[name] {
-				t.Errorf("%s imports sibling primitive package %q; OrderedIndex has no fallback store", path, importPath)
+			if suffix, isSibling := denied[strings.TrimPrefix(importPath, prefix)]; isSibling {
+				t.Errorf("%s imports %q, which owns the %q table; OrderedIndex has no fallback store", path, importPath, suffix)
 			}
 		}
 	}
@@ -199,17 +306,8 @@ func TestOrderedIndexNeverFallsBackToAnotherPrimitive(t *testing.T) {
 	// A package-path denial does not reach a fallback written at the table
 	// level, which needs no import at all: the ordered statements may name only
 	// the ordered tables.
-	var forbidden []string
-	for _, suffix := range migrationTableSuffixes(t) {
-		if !strings.HasPrefix(suffix, "ordered_") {
-			forbidden = append(forbidden, suffix)
-		}
-	}
-	if len(forbidden) == 0 {
-		t.Fatal("no non-ordered table suffixes derived; the fallback guard has no input")
-	}
 	literals := orderedProductionStringLiterals(t)
-	for _, suffix := range forbidden {
+	for _, suffix := range denied {
 		pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(suffix) + `\b`)
 		for _, literal := range literals {
 			if pattern.MatchString(literal) {
@@ -352,20 +450,48 @@ func readAccessPath(sql string) (statementAccessPath, error) {
 // coveringIndex reports the declared index that answers the statement without a
 // sort: every leading index column the statement does not pin to a constant
 // must be exactly the next ordering column, in the same direction.
-func coveringIndex(indexes []declaredIndex, path statementAccessPath) (string, bool) {
+// coveringIndex reports the declared index that answers the statement without a
+// sort, or the reason each declared index cannot.
+func coveringIndex(indexes []declaredIndex, path statementAccessPath) (string, bool, []string) {
+	var reasons []string
 	for _, index := range indexes {
-		if !indexAnswers(index, path) {
-			continue
+		if reason := indexAnswers(index, path); reason == "" {
+			return index.name, true, nil
+		} else {
+			reasons = append(reasons, index.name+": "+reason)
 		}
-		return index.name, true
 	}
-	return "", false
+	return "", false, reasons
 }
 
-func indexAnswers(index declaredIndex, path statementAccessPath) bool {
+// normalizeSQLFragment removes the cosmetic differences — surrounding
+// parentheses and whitespace runs — that make two spellings of one predicate
+// look unequal.
+func normalizeSQLFragment(fragment string) string {
+	fragment = strings.Join(strings.Fields(fragment), " ")
+	for {
+		trimmed := strings.TrimSpace(fragment)
+		if len(trimmed) < 2 || trimmed[0] != '(' || trimmed[len(trimmed)-1] != ')' {
+			break
+		}
+		inner, end := balancedParenthesis(trimmed, 0)
+		if end != len(trimmed)-1 {
+			break
+		}
+		fragment = inner
+	}
+	return strings.ReplaceAll(strings.ReplaceAll(fragment, "(", ""), ")", "")
+}
+
+// indexAnswers returns "" when the index answers the statement, and otherwise
+// the reason it cannot. A partial index whose predicate the statement does not
+// repeat is a fact about the migration and the statement together, so the
+// reason says which side it read.
+func indexAnswers(index declaredIndex, path statementAccessPath) string {
+	where := normalizeSQLFragment(path.where)
 	for _, conjunct := range index.predicate {
-		if !strings.Contains(path.where, conjunct) {
-			return false
+		if !strings.Contains(where, normalizeSQLFragment(conjunct)) {
+			return fmt.Sprintf("it is declared in the migration as a partial index over %q, which this statement's WHERE does not repeat", conjunct)
 		}
 	}
 	columns := index.columns
@@ -373,32 +499,75 @@ func indexAnswers(index declaredIndex, path statementAccessPath) bool {
 		columns = columns[1:]
 	}
 	if len(columns) < len(path.orderBy) {
-		return false
+		return fmt.Sprintf("only %d of its columns remain unpinned, fewer than the %d ordering columns", len(columns), len(path.orderBy))
 	}
-	for i, want := range path.orderBy {
-		if columns[i] != want {
-			return false
+	for _, inverted := range []bool{false, true} {
+		matched := true
+		for i, want := range path.orderBy {
+			if columns[i].name != want.name || columns[i].descending != (want.descending != inverted) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return ""
 		}
 	}
-	return true
+	return "its remaining key does not match the ordering columns in either scan direction"
 }
 
-func orderedPageStatements() []struct {
-	name string
-	sql  string
-} {
+type coveredPageStatement struct {
+	name   string
+	family string
+	page   string
+	sql    string
+}
+
+// orderedPageStatements enumerates the six pages the coverage guard measures.
+// It is bounded exactly as the integration plan gate's own table is bounded —
+// six cases, one first and one middle per builder family — because an
+// unbounded enumeration is how a seventh builder becomes silently uncovered,
+// and an empty one is how the whole guard becomes vacuous.
+func orderedPageStatements(t *testing.T) []coveredPageStatement {
+	t.Helper()
 	const table = `"looprig"."p_ordered_records"`
-	return []struct {
-		name string
-		sql  string
-	}{
-		{"ordered first", orderedquery.Ordered(table, "sessions", "scope", 0, 25).SQL},
-		{"ordered middle", orderedquery.Ordered(table, "sessions", "scope", 500, 25).SQL},
-		{"ranked first", orderedquery.Ranked(table, "sessions", "workers", nil, 24).SQL},
-		{"ranked middle", orderedquery.Ranked(table, "sessions", "workers", &orderedquery.RankedPosition{}, 24).SQL},
-		{"due first", orderedquery.Due(table, "sessions", 999, nil, 24).SQL},
-		{"due middle", orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{}, 24).SQL},
+	statements := []coveredPageStatement{
+		{"ordered first", "Ordered", "first", orderedquery.Ordered(table, "sessions", "scope", 0, 25).SQL},
+		{"ordered middle", "Ordered", "middle", orderedquery.Ordered(table, "sessions", "scope", 500, 25).SQL},
+		{"ranked first", "Ranked", "first", orderedquery.Ranked(table, "sessions", "workers", nil, 24).SQL},
+		{"ranked middle", "Ranked", "middle", orderedquery.Ranked(table, "sessions", "workers", &orderedquery.RankedPosition{}, 24).SQL},
+		{"due first", "Due", "first", orderedquery.Due(table, "sessions", 999, nil, 24).SQL},
+		{"due middle", "Due", "middle", orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{}, 24).SQL},
 	}
+	if len(statements) != 6 {
+		t.Fatalf("coverage enumerates %d page statements, want exactly 6", len(statements))
+	}
+	// Ordered's cursor is a bound parameter rather than an extra predicate, so
+	// its two pages share one SQL string by design; only the keyset builders
+	// differ between pages.
+	pages := make(map[string]map[string]int)
+	byPage := make(map[string]string)
+	for _, statement := range statements {
+		if statement.sql == "" {
+			t.Fatalf("%s produced an empty statement, so it constrains nothing", statement.name)
+		}
+		if statement.family != "Ordered" {
+			if previous, ok := byPage[statement.family]; ok && previous == statement.sql {
+				t.Fatalf("%s builds the same SQL for both pages, so the keyset predicate is not being exercised", statement.family)
+			}
+			byPage[statement.family] = statement.sql
+		}
+		if pages[statement.family] == nil {
+			pages[statement.family] = make(map[string]int)
+		}
+		pages[statement.family][statement.page]++
+	}
+	for _, family := range []string{"Ordered", "Ranked", "Due"} {
+		if pages[family]["first"] != 1 || pages[family]["middle"] != 1 {
+			t.Fatalf("orderedquery.%s coverage = %d first/%d middle, want 1/1, matching the bound validatePlanGateStatementOwnership holds the integration table to", family, pages[family]["first"], pages[family]["middle"])
+		}
+	}
+	return statements
 }
 
 // TestOrderedIndexPageStatementsAreCoveredByADeclaredIndex is the table-scan
@@ -410,18 +579,50 @@ func orderedPageStatements() []struct {
 func TestOrderedIndexPageStatementsAreCoveredByADeclaredIndex(t *testing.T) {
 	t.Parallel()
 	indexes := declaredOrderedIndexes(t)
-	for _, statement := range orderedPageStatements() {
+	for _, statement := range orderedPageStatements(t) {
 		path, err := readAccessPath(statement.sql)
 		if err != nil {
 			t.Errorf("%s: %v: %s", statement.name, err, statement.sql)
 			continue
 		}
-		name, ok := coveringIndex(indexes, path)
+		name, ok, reasons := coveringIndex(indexes, path)
 		if !ok {
-			t.Errorf("%s has no declared index that answers it without a sort: %s", statement.name, statement.sql)
+			t.Errorf("%s is not answered without a sort by any index the migration declares.\n  statement: %s\n  %s", statement.name, statement.sql, strings.Join(reasons, "\n  "))
 			continue
 		}
 		t.Logf("%s is answered by index %q", statement.name, name)
+	}
+}
+
+// TestIndexCoverageClassifierAcceptsLegalAccessPaths pins the shapes the
+// classifier must not call a table scan. Reverse pagination is the obvious next
+// feature for a keyset pager, and PostgreSQL answers an exactly-reversed order
+// with a backward index scan: measured on the real rank index shape, the plan
+// is "Index Only Scan Backward using ..._rank_idx" with no Sort node. An
+// earlier revision compared the direction of every column literally, so it
+// would have reported that legal plan as unbacked while the integration plan
+// gate correctly passed it. Cosmetic parentheses around a partial index's
+// predicate in the migration must not change the answer either.
+func TestIndexCoverageClassifierAcceptsLegalAccessPaths(t *testing.T) {
+	t.Parallel()
+	indexes := declaredOrderedIndexes(t)
+	const columns = "namespace, ordering_scope, stable_key"
+	const table = `"looprig"."p_ordered_records"`
+	for _, test := range []struct{ name, sql string }{
+		{"ranked page read backwards", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted ORDER BY rank_value ASC, stable_key ASC, ordering_scope ASC LIMIT $3"},
+		{"due page read backwards", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND due_state = 1 AND NOT deleted AND due_at <= $2 ORDER BY due_at DESC, stable_key DESC, ordering_scope DESC LIMIT $3"},
+		{"ordered page read backwards", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ordering_scope = $2 ORDER BY order_id DESC, stable_key DESC LIMIT $3"},
+		{"partial predicate written with parentheses", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND (due_state = 1) AND (NOT deleted) AND due_at <= $2 ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT $3"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path, err := readAccessPath(test.sql)
+			if err != nil {
+				t.Fatalf("readAccessPath: %v", err)
+			}
+			if _, ok, reasons := coveringIndex(indexes, path); !ok {
+				t.Fatalf("coverage classifier rejected a legal access path:\n  %s", strings.Join(reasons, "\n  "))
+			}
+		})
 	}
 }
 
@@ -435,7 +636,6 @@ func TestIndexCoverageClassifierRejectsUnbackedStatements(t *testing.T) {
 		{"no WHERE at all", "SELECT " + columns + " FROM " + table + " ORDER BY " + table + ".order_id ASC, stable_key ASC LIMIT $3"},
 		{"ordering column is not indexed", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ordering_scope = $2 ORDER BY revision ASC LIMIT $3"},
 		{"scope no longer pinned", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 ORDER BY " + table + ".order_id ASC, stable_key ASC LIMIT $3"},
-		{"ranked direction reversed", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted ORDER BY rank_value ASC, stable_key ASC, ordering_scope ASC LIMIT $3"},
 		{"due partial-index predicate dropped", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND due_state = 1 ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT $3"},
 		{"ordering tail truncated to a non-key column", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted ORDER BY rank_value DESC, revision DESC LIMIT $3"},
 	} {
@@ -444,7 +644,7 @@ func TestIndexCoverageClassifierRejectsUnbackedStatements(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if name, ok := coveringIndex(indexes, path); ok {
+			if name, ok, _ := coveringIndex(indexes, path); ok {
 				t.Fatalf("coverage classifier accepted an unbacked statement against index %q: %s", name, test.sql)
 			}
 		})
@@ -468,8 +668,9 @@ func TestOrderedIndexPlanGateUsesProductionStatements(t *testing.T) {
 	}
 }
 
-func TestPlanGateStatementOwnershipRejectsCopiesAndUnusedBuilders(t *testing.T) {
-	validEntries := []string{
+// validPlanEntries is the single legal plan-case table the fixtures start from.
+func validPlanEntries() []string {
+	return []string{
 		`{family: orderedPlanOrder, page: orderedPlanFirst, statement: orderedquery.Ordered(table, "sessions", "scope", 0, 25)}`,
 		`{family: orderedPlanOrder, page: orderedPlanMiddle, statement: orderedquery.Ordered(table, "sessions", "scope", 500, 25)}`,
 		`{family: orderedPlanRanked, page: orderedPlanFirst, statement: orderedquery.Ranked(table, "sessions", "rank", nil, 24)}`,
@@ -477,6 +678,10 @@ func TestPlanGateStatementOwnershipRejectsCopiesAndUnusedBuilders(t *testing.T) 
 		`{family: orderedPlanDue, page: orderedPlanFirst, statement: orderedquery.Due(table, "sessions", 999, nil, 24)}`,
 		`{family: orderedPlanDue, page: orderedPlanMiddle, statement: orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{}, 24)}`,
 	}
+}
+
+func TestPlanGateStatementOwnershipRejectsCopiesAndUnusedBuilders(t *testing.T) {
+	validEntries := validPlanEntries()
 	copied := `orderedquery.Statement{SQL: "SELECT namespace, ordering_scope, stable_key, ranking_scope, revision::text, order_id::text, value, value_is_nil, ranked, rank_value, due_state, due_at, deleted FROM records WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted ORDER BY rank_value DESC, stable_key DESC, ordering_scope DESC LIMIT $3"}`
 	formattedCopy := "orderedquery.Statement{SQL: `SELECT namespace, ordering_scope, stable_key\nFROM records\nWHERE namespace = $1\n  AND due_state = 1\n  AND NOT deleted\nORDER BY due_at ASC, stable_key ASC, ordering_scope ASC\nLIMIT $3`}"
 
@@ -531,14 +736,7 @@ func TestPlanGateStatementOwnershipAllowsLegalFormatting(t *testing.T) {
 }
 
 func TestPlanGateOwnershipBindsTheActuallyExplainedCaseSource(t *testing.T) {
-	deadEntries := []string{
-		`{family: orderedPlanOrder, page: orderedPlanFirst, statement: orderedquery.Ordered(table, "sessions", "scope", 0, 25)}`,
-		`{family: orderedPlanOrder, page: orderedPlanMiddle, statement: orderedquery.Ordered(table, "sessions", "scope", 500, 25)}`,
-		`{family: orderedPlanRanked, page: orderedPlanFirst, statement: orderedquery.Ranked(table, "sessions", "rank", nil, 24)}`,
-		`{family: orderedPlanRanked, page: orderedPlanMiddle, statement: orderedquery.Ranked(table, "sessions", "rank", &orderedquery.RankedPosition{}, 24)}`,
-		`{family: orderedPlanDue, page: orderedPlanFirst, statement: orderedquery.Due(table, "sessions", 999, nil, 24)}`,
-		`{family: orderedPlanDue, page: orderedPlanMiddle, statement: orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{}, 24)}`,
-	}
+	deadEntries := validPlanEntries()
 	t.Run("dead helper and live copied table", func(t *testing.T) {
 		deadTableLiveCopy := planOwnershipFixtureWithLoop(deadEntries, "", `live := []orderedPlanCase{{statement: orderedquery.Statement{SQL: "SELECT copied"}}}
 	for _, test := range live {
@@ -592,14 +790,7 @@ func TestPlanGateOwnershipBindsTheActuallyExplainedCaseSource(t *testing.T) {
 // Query, Exec or SendBatch decoy satisfied it while a copied statement supplied
 // the plan that was actually asserted.
 func TestPlanGateOwnershipRejectsEveryExecutionSpellingAndUnboundAssertions(t *testing.T) {
-	entries := []string{
-		`{family: orderedPlanOrder, page: orderedPlanFirst, statement: orderedquery.Ordered(table, "sessions", "scope", 0, 25)}`,
-		`{family: orderedPlanOrder, page: orderedPlanMiddle, statement: orderedquery.Ordered(table, "sessions", "scope", 500, 25)}`,
-		`{family: orderedPlanRanked, page: orderedPlanFirst, statement: orderedquery.Ranked(table, "sessions", "rank", nil, 24)}`,
-		`{family: orderedPlanRanked, page: orderedPlanMiddle, statement: orderedquery.Ranked(table, "sessions", "rank", &orderedquery.RankedPosition{}, 24)}`,
-		`{family: orderedPlanDue, page: orderedPlanFirst, statement: orderedquery.Due(table, "sessions", 999, nil, 24)}`,
-		`{family: orderedPlanDue, page: orderedPlanMiddle, statement: orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{}, 24)}`,
-	}
+	entries := validPlanEntries()
 	const tail = `var plan any
 		json.Unmarshal(raw, &plan)
 		_ = planUsesIndex(plan, test.indexName)
@@ -621,8 +812,14 @@ func TestPlanGateOwnershipRejectsEveryExecutionSpellingAndUnboundAssertions(t *t
 		` + tail),
 		},
 		{
-			name: "live Exec decoy beside the mandated QueryRow",
-			loop: loop(`tx.Exec(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT copied lookalike")
+			name: "live Query decoy on the plan transaction",
+			loop: loop(`tx.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT copied lookalike")
+		tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
+		` + tail),
+		},
+		{
+			name: "live QueryFunc decoy on the plan transaction",
+			loop: loop(`tx.QueryFunc(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT copied lookalike", nil, nil, nil)
 		tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
 		` + tail),
 		},
@@ -660,8 +857,8 @@ func TestPlanGateOwnershipRejectsEveryExecutionSpellingAndUnboundAssertions(t *t
 		` + tail),
 		},
 		{
-			name: "row-returning decoy hoisted out of the range",
-			loop: `hoisted, _ := admin.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT copied lookalike")
+			name: "plan read hoisted out of the range onto the same transaction",
+			loop: `hoisted, _ := tx.Query(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT copied lookalike")
 	_ = hoisted
 	` + loop(`tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
 		`+tail),
@@ -676,16 +873,80 @@ func TestPlanGateOwnershipRejectsEveryExecutionSpellingAndUnboundAssertions(t *t
 	}
 }
 
+// TestPlanGateOwnershipAllowsSeedingAndPerCasePlannerControls pins the shapes
+// receiver binding deliberately permits. An earlier revision counted call names
+// over the whole body, which rejected all three: CopyFrom is the idiomatic pgx
+// bulk load and this gate seeds ten thousand rows, per-case planner controls
+// and ANALYZE are Exec, and neither can supply the plan that is asserted. A
+// guard that forbids them buys nothing and costs a legal implementation.
+func TestPlanGateOwnershipAllowsSeedingAndPerCasePlannerControls(t *testing.T) {
+	t.Parallel()
+	entries := validPlanEntries()
+	const tail = `var plan any
+		json.Unmarshal(raw, &plan)
+		_ = planUsesIndex(plan, test.indexName)
+		_ = planHasNodeType(plan, "Sort")`
+	for _, test := range []struct{ name, loop string }{
+		{
+			name: "seeded with CopyFrom and analysed before the range",
+			loop: `admin.CopyFrom(ctx, pgx.Identifier{"records"}, columns, source)
+	admin.Exec(ctx, "ANALYZE "+table)
+	rows, _ := admin.Query(ctx, "SELECT count(*) FROM "+table)
+	_ = rows
+	for _, test := range orderedPlanCases(table, prefix) {
+		var raw []byte
+		tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
+		` + tail + `
+	}`,
+		},
+		{
+			name: "per-case planner controls and ANALYZE inside the range",
+			loop: `for _, test := range orderedPlanCases(table, prefix) {
+		tx.Exec(ctx, "SET LOCAL enable_seqscan = off")
+		tx.Exec(ctx, "ANALYZE "+table)
+		var raw []byte
+		tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw)
+		` + tail + `
+	}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validatePlanGateStatementOwnership([]byte(planOwnershipFixtureWithLoop(entries, "", test.loop))); err != nil {
+				t.Fatalf("ownership validation rejected a legal seeding or planner-control shape: %v", err)
+			}
+		})
+	}
+}
+
+// TestRowReturningMethodSetIsFullyExercised pins the size of the shared set so
+// a member cannot be deleted silently. Each member is exercised as a decoy by
+// the plan-gate and production spelling tests above and below; deleting one
+// would let that spelling through, and the count is what notices.
+func TestRowReturningMethodSetIsFullyExercised(t *testing.T) {
+	t.Parallel()
+	want := map[string]bool{"Query": true, "QueryRow": true, "QueryFunc": true, "SendBatch": true}
+	if len(rowReturningMethods) != len(want) {
+		t.Fatalf("rowReturningMethods = %v, want exactly %v; every member must be pinned by a decoy fixture", rowReturningMethods, want)
+	}
+	for name := range want {
+		if !rowReturningMethods[name] {
+			t.Errorf("rowReturningMethods lost %q", name)
+		}
+	}
+}
+
 // TestProductionOwnershipRejectsEveryExecutionSpelling is the production-side
 // sibling of the same blindness: methodCallsNamed(body, "Query") could not see a
 // live QueryRow, Exec or SendBatch standing beside the mandated Query.
 func TestProductionOwnershipRejectsEveryExecutionSpelling(t *testing.T) {
-	ordered := `q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`
-	due := `q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`
+	ordered := `q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`
+	due := `q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`
 	for _, test := range []struct{ name, ranked string }{
-		{name: "live QueryRow decoy", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); s.pool.QueryRow(ctx, "SELECT copied").Scan(&sink); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
-		{name: "live Exec decoy", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); s.pool.Exec(ctx, "SELECT copied"); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
-		{name: "live SendBatch decoy", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); s.pool.SendBatch(ctx, batch); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
+		{name: "live QueryRow decoy", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); s.pool.QueryRow(ctx, "SELECT copied").Scan(&sink); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`},
+		{name: "live QueryFunc decoy", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); s.pool.QueryFunc(ctx, "SELECT copied", nil, nil, nil); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`},
+		{name: "live read inside a transaction opened from the same pool", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); tx, _ := s.pool.BeginTx(ctx, opts); tx.Query(ctx, "SELECT copied"); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`},
+		{name: "live read on another store's pool supplies the scanned rows", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); dead, _ := s.pool.Query(ctx, q.SQL, q.Args...); _ = dead; rows, _ := other.pool.Query(ctx, "SELECT copied"); scanRecords(rows)`},
+		{name: "live SendBatch decoy", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); s.pool.SendBatch(ctx, batch); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`},
 		{name: "statement read through QueryRow instead of Query", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); s.pool.QueryRow(ctx, q.SQL, q.Args...).Scan(&sink)`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -698,9 +959,9 @@ func TestProductionOwnershipRejectsEveryExecutionSpelling(t *testing.T) {
 
 func TestProductionStatementOwnershipRequiresConsumedDirectBuilders(t *testing.T) {
 	valid := productionOwnershipFixture(
-		`q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := ((s.pool.Query))(ctx, (q.SQL), (q.Args)...)`,
-		`rankStatement := orderedquery.Ranked(table, namespace, scope, position, limit); rows, _ := s.pool.Query(ctx, rankStatement.SQL, rankStatement.Args...)`,
-		`dueStatement := (orderedquery.Due(table, namespace, bound, position, limit)); rows, _ := s.pool.Query(ctx, dueStatement.SQL, dueStatement.Args...)`,
+		`q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := ((s.pool.Query))(ctx, (q.SQL), (q.Args)...); scanRecords(rows)`,
+		`rankStatement := orderedquery.Ranked(table, namespace, scope, position, limit); rows, _ := s.pool.Query(ctx, rankStatement.SQL, rankStatement.Args...); scanRecords(rows)`,
+		`dueStatement := (orderedquery.Due(table, namespace, bound, position, limit)); rows, _ := s.pool.Query(ctx, dueStatement.SQL, dueStatement.Args...); scanRecords(rows)`,
 	)
 	if err := validateProductionStatementOwnership([]byte(valid)); err != nil {
 		t.Fatalf("production ownership rejected direct consumed builders: %v", err)
@@ -710,17 +971,17 @@ func TestProductionStatementOwnershipRequiresConsumedDirectBuilders(t *testing.T
 		name   string
 		ranked string
 	}{
-		{name: "unused builder cannot satisfy ownership", ranked: `_ = orderedquery.Ranked(table, namespace, scope, position, limit); q := orderedquery.Statement{SQL: "SELECT copied"}; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
-		{name: "shadowed unused builder cannot satisfy ownership", ranked: `q := orderedquery.Statement{SQL: "SELECT copied"}; { q := orderedquery.Ranked(table, namespace, scope, position, limit); _ = q }; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
-		{name: "builder result not consumed", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); copied := orderedquery.Statement{SQL: "SELECT copied"}; rows, _ := s.pool.Query(ctx, copied.SQL, copied.Args...)`},
-		{name: "wrong family", ranked: `q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
+		{name: "unused builder cannot satisfy ownership", ranked: `_ = orderedquery.Ranked(table, namespace, scope, position, limit); q := orderedquery.Statement{SQL: "SELECT copied"}; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`},
+		{name: "shadowed unused builder cannot satisfy ownership", ranked: `q := orderedquery.Statement{SQL: "SELECT copied"}; { q := orderedquery.Ranked(table, namespace, scope, position, limit); _ = q }; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`},
+		{name: "builder result not consumed", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); copied := orderedquery.Statement{SQL: "SELECT copied"}; rows, _ := s.pool.Query(ctx, copied.SQL, copied.Args...); scanRecords(rows)`},
+		{name: "wrong family", ranked: `q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			source := productionOwnershipFixture(
-				`q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`,
+				`q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`,
 				test.ranked,
-				`q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`,
+				`q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`,
 			)
 			if err := validateProductionStatementOwnership([]byte(source)); err == nil {
 				t.Fatal("production ownership accepted an unused, unconsumed, or wrong-family builder")
@@ -730,16 +991,15 @@ func TestProductionStatementOwnershipRequiresConsumedDirectBuilders(t *testing.T
 }
 
 func TestProductionOwnershipRejectsDecoyQueriesAndReceiverConfusion(t *testing.T) {
-	ordered := `q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`
-	due := `q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`
+	ordered := `q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`
+	due := `q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`
 	tests := []struct {
 		name   string
 		ranked string
 	}{
-		{name: "dead second receiver query", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); if false { s.pool.Query(ctx, "SELECT decoy") }; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
-		{name: "second query on another receiver", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); if false { other.pool.Query(ctx, "SELECT decoy") }; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
-		{name: "copied live query with dead valid query", ranked: `valid := orderedquery.Ranked(table, namespace, scope, position, limit); if false { s.pool.Query(ctx, valid.SQL, valid.Args...) }; copied := orderedquery.Statement{SQL: "SELECT copied"}; rows, _ := s.pool.Query(ctx, copied.SQL, copied.Args...)`},
-		{name: "receiver shadow", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); { s := other; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); _ = rows }`},
+		{name: "dead second receiver query", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); if false { s.pool.Query(ctx, "SELECT decoy") }; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`},
+		{name: "copied live query with dead valid query", ranked: `valid := orderedquery.Ranked(table, namespace, scope, position, limit); if false { s.pool.Query(ctx, valid.SQL, valid.Args...) }; copied := orderedquery.Statement{SQL: "SELECT copied"}; rows, _ := s.pool.Query(ctx, copied.SQL, copied.Args...); scanRecords(rows)`},
+		{name: "receiver shadow", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); { s := other; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows) }`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -752,8 +1012,8 @@ func TestProductionOwnershipRejectsDecoyQueriesAndReceiverConfusion(t *testing.T
 	// Duplicate method declarations are parser-valid, but intentionally invalid to
 	// the Go type checker. The structural guard must diagnose the duplicate rather
 	// than silently letting a bare-name map overwrite one declaration.
-	duplicate := productionOwnershipFixture(ordered, `copied := orderedquery.Statement{SQL: "SELECT copied"}; rows, _ := s.pool.Query(ctx, copied.SQL, copied.Args...)`, due) +
-		`func (s *Store) ListRanked() { q := orderedquery.Ranked(table, namespace, scope, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...) }`
+	duplicate := productionOwnershipFixture(ordered, `copied := orderedquery.Statement{SQL: "SELECT copied"}; rows, _ := s.pool.Query(ctx, copied.SQL, copied.Args...); scanRecords(rows)`, due) +
+		`func (s *Store) ListRanked() { q := orderedquery.Ranked(table, namespace, scope, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows) }`
 	if _, err := parser.ParseFile(token.NewFileSet(), "duplicate.go", duplicate, 0); err != nil {
 		t.Fatalf("duplicate declaration fixture is not parser-valid: %v", err)
 	}
@@ -903,17 +1163,6 @@ func validatePlanGateStatementOwnership(source []byte) error {
 	return validatePlanIntegrationLoop(file, helpers[0])
 }
 
-func freeFunctionsNamed(file *ast.File, name string) []*ast.FuncDecl {
-	var functions []*ast.FuncDecl
-	for _, declaration := range file.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if ok && function.Recv == nil && function.Name.Name == name && function.Body != nil {
-			functions = append(functions, function)
-		}
-	}
-	return functions
-}
-
 func returnedPlanCaseTable(function *ast.FuncDecl) (*ast.CompositeLit, error) {
 	var returns []*ast.ReturnStmt
 	ast.Inspect(function.Body, func(node ast.Node) bool {
@@ -930,27 +1179,6 @@ func returnedPlanCaseTable(function *ast.FuncDecl) (*ast.CompositeLit, error) {
 		return nil, fmt.Errorf("orderedPlanCases must directly return []orderedPlanCase")
 	}
 	return literal, nil
-}
-
-func isSliceOfNamed(expression ast.Expr, name string) bool {
-	array, ok := unparen(expression).(*ast.ArrayType)
-	if !ok || array.Len != nil {
-		return false
-	}
-	identifier, ok := unparen(array.Elt).(*ast.Ident)
-	return ok && identifier.Name == name
-}
-
-func keyedIdentifier(literal *ast.CompositeLit, field string) (string, error) {
-	expression, err := keyedField(literal, field)
-	if err != nil {
-		return "", err
-	}
-	identifier, ok := unparen(expression).(*ast.Ident)
-	if !ok {
-		return "", fmt.Errorf("%s is not a plan metadata identifier", field)
-	}
-	return identifier.Name, nil
 }
 
 func validatePlanIntegrationLoop(file *ast.File, casesHelper *ast.FuncDecl) error {
@@ -992,35 +1220,32 @@ func validatePlanIntegrationLoop(file *ast.File, casesHelper *ast.FuncDecl) erro
 	if !ok || rangeValue.Name == "_" {
 		return fmt.Errorf("orderedPlanCases range must bind its case value")
 	}
-	// Nothing outside the ranged body may return rows. A hoisted decoy read is
-	// otherwise free to fill the variable the plan assertions consume.
-	for _, call := range executionCallsIn(test.Body) {
-		if nodeContains(ranges[0].Body, call) {
-			continue
-		}
-		if rowReturningMethods[callSelectorName(call)] {
-			return fmt.Errorf("plan integration test performs a row-returning %s outside the orderedPlanCases range", callSelectorName(call))
+	// Only the transaction under test may read rows. Binding to the receiver,
+	// rather than counting call names over the whole body, is what lets the
+	// gate seed with admin.CopyFrom, set per-case planner controls with
+	// tx.Exec, or ANALYZE inside the loop, while still refusing a second
+	// source for the plan that is asserted.
+	transaction := transactions[0]
+	for _, call := range rowReturningCallsOn(test.Body, []*ast.Ident{transaction}) {
+		if !nodeContains(ranges[0].Body, call) {
+			return fmt.Errorf("plan integration test reads rows from the plan transaction with %s outside the orderedPlanCases range; the asserted plan must have exactly one source", callSelectorName(call))
 		}
 	}
-	// Inside the ranged body the mandated statement is the only thing that may
-	// reach the database at all. Naming QueryRow alone made the guard exactly
-	// as strong as the last spelling someone thought of: a dead QueryRow beside
-	// a live Query, Exec or SendBatch passed it.
-	executions := executionCallsIn(ranges[0].Body)
-	if len(executions) != 1 {
-		return fmt.Errorf("orderedPlanCases range body has %d database execution calls (%s), want exactly the one mandated QueryRow", len(executions), strings.Join(executionCallNames(executions), ", "))
+	reads := rowReturningCallsOn(ranges[0].Body, []*ast.Ident{transaction})
+	if len(reads) != 1 {
+		return fmt.Errorf("orderedPlanCases range body reads rows from the plan transaction %d times (%s). The asserted plan must come from the one mandated statement, so exactly one QueryRow is allowed.", len(reads), strings.Join(callNames(reads), ", "))
 	}
-	query := executions[0]
+	query := reads[0]
 	if callSelectorName(query) != "QueryRow" {
-		return fmt.Errorf("orderedPlanCases range body executes %s, want the mandated QueryRow", callSelectorName(query))
+		return fmt.Errorf("orderedPlanCases range body reads the plan with %s; the mandated form is a single-row QueryRow whose Scan result the index assertions read", callSelectorName(query))
 	}
 	selector := unparen(query.Fun).(*ast.SelectorExpr)
 	queryReceiver, ok := unparen(selector.X).(*ast.Ident)
-	if !ok || !sameObject(queryReceiver, transactions[0]) {
+	if !ok || !sameObject(queryReceiver, transaction) {
 		return fmt.Errorf("plan integration QueryRow is not called on its BeginTx result")
 	}
 	if len(query.Args) != 3 || query.Ellipsis == token.NoPos || !isExplainStatement(query.Args[1], rangeValue) || !isNestedSelector(query.Args[2], rangeValue, "statement", "Args") {
-		return fmt.Errorf("plan integration QueryRow must explain the ranged case statement SQL with EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) and its variadic Args")
+		return fmt.Errorf("plan integration QueryRow must explain the ranged case statement SQL with %s and its variadic Args", explainFlavour)
 	}
 	return validatePlanAssertionChain(ranges[0].Body, query)
 }
@@ -1074,111 +1299,6 @@ func validatePlanAssertionChain(body *ast.BlockStmt, query *ast.CallExpr) error 
 // executionMethods is the set of pgx entry points by which a statement can
 // reach the database, and rowReturningMethods the subset that can supply a
 // value an assertion later reads.
-var executionMethods = map[string]bool{
-	"Query": true, "QueryRow": true, "Exec": true, "SendBatch": true,
-	"CopyFrom": true, "Begin": true, "BeginTx": true, "BeginFunc": true,
-}
-
-var rowReturningMethods = map[string]bool{
-	"Query": true, "QueryRow": true, "SendBatch": true, "CopyFrom": true, "BeginFunc": true,
-}
-
-func executionCallsIn(root ast.Node) []*ast.CallExpr {
-	var calls []*ast.CallExpr
-	ast.Inspect(root, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		if selector, ok := unparen(call.Fun).(*ast.SelectorExpr); ok && executionMethods[selector.Sel.Name] {
-			calls = append(calls, call)
-		}
-		return true
-	})
-	return calls
-}
-
-func executionCallNames(calls []*ast.CallExpr) []string {
-	names := make([]string, 0, len(calls))
-	for _, call := range calls {
-		names = append(names, callSelectorName(call))
-	}
-	return names
-}
-
-func callSelectorName(call *ast.CallExpr) string {
-	selector, ok := unparen(call.Fun).(*ast.SelectorExpr)
-	if !ok {
-		return ""
-	}
-	return selector.Sel.Name
-}
-
-func addressedIdent(expression ast.Expr) (*ast.Ident, bool) {
-	unary, ok := unparen(expression).(*ast.UnaryExpr)
-	if !ok || unary.Op != token.AND {
-		return nil, false
-	}
-	identifier, ok := unparen(unary.X).(*ast.Ident)
-	return identifier, ok
-}
-
-func packageCallsNamed(root ast.Node, packageName, name string) []*ast.CallExpr {
-	var calls []*ast.CallExpr
-	for _, call := range selectorCallsNamed(root, name) {
-		selector := unparen(call.Fun).(*ast.SelectorExpr)
-		if qualifier, ok := selectorPackage(selector); ok && qualifier == packageName {
-			calls = append(calls, call)
-		}
-	}
-	return calls
-}
-
-func freeCallsNamed(root ast.Node, name string) []*ast.CallExpr {
-	var calls []*ast.CallExpr
-	ast.Inspect(root, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		if identifier, ok := unparen(call.Fun).(*ast.Ident); ok && identifier.Name == name {
-			calls = append(calls, call)
-		}
-		return true
-	})
-	return calls
-}
-
-func isSelectorCall(expression ast.Expr, method string) bool {
-	call, ok := unparen(expression).(*ast.CallExpr)
-	if !ok {
-		return false
-	}
-	selector, ok := unparen(call.Fun).(*ast.SelectorExpr)
-	return ok && selector.Sel.Name == method
-}
-
-func isHelperCall(expression ast.Expr, helper *ast.FuncDecl) bool {
-	call, ok := unparen(expression).(*ast.CallExpr)
-	if !ok {
-		return false
-	}
-	identifier, ok := unparen(call.Fun).(*ast.Ident)
-	return ok && identifier.Obj != nil && identifier.Obj == helper.Name.Obj
-}
-
-func nodeContains(root ast.Node, target ast.Node) bool {
-	found := false
-	ast.Inspect(root, func(node ast.Node) bool {
-		if node == target {
-			found = true
-			return false
-		}
-		return !found
-	})
-	return found
-}
-
 func isExplainStatement(expression ast.Expr, value *ast.Ident) bool {
 	binary, ok := unparen(expression).(*ast.BinaryExpr)
 	if !ok || binary.Op != token.ADD {
@@ -1245,19 +1365,58 @@ func validateProductionStatementOwnership(source []byte) error {
 		if len(statements) != 1 {
 			return fmt.Errorf("List%s has %d direct orderedquery.%s statement assignments, want exactly 1", family, len(statements), family)
 		}
-		executions := executionCallsIn(function.Body)
-		if len(executions) != 1 {
-			return fmt.Errorf("List%s has %d database execution calls (%s), want exactly one Query", family, len(executions), strings.Join(executionCallNames(executions), ", "))
+		// Bound to the receiver's pool and to any transaction opened from it,
+		// and restricted to calls that can actually produce the page. A
+		// decoy Exec, CopyFrom or BeginTx cannot return rows, so counting it
+		// would reject a legal implementation without protecting anything.
+		receivers := append([]*ast.Ident{receiver}, bindingsFromCall(function.Body, "BeginTx", []*ast.Ident{receiver})...)
+		reads := rowReturningCallsOn(function.Body, receivers)
+		if len(reads) != 1 {
+			return fmt.Errorf("List%s reads rows %d times (%s). The page must come from the one orderedquery statement, so exactly one Query is allowed.", family, len(reads), strings.Join(callNames(reads), ", "))
 		}
-		query := executions[0]
+		query := reads[0]
 		if callSelectorName(query) != "Query" {
-			return fmt.Errorf("List%s executes %s, want the single pool Query that consumes its orderedquery statement", family, callSelectorName(query))
+			return fmt.Errorf("List%s reads its page with %s; a page is many rows and must be read with Query so every row is scanned", family, callSelectorName(query))
 		}
 		if !isReceiverPoolCall(query, receiver) || len(query.Args) != 3 || query.Ellipsis == token.NoPos ||
 			!isStatementSelector(query.Args[1], statements[0], "SQL") ||
 			!isStatementSelector(query.Args[2], statements[0], "Args") {
 			return fmt.Errorf("List%s Query is not its receiver-bound pool consuming the one orderedquery.%s statement SQL and variadic Args", family, family)
 		}
+		// Binding to a receiver is not enough on its own: a live read on some
+		// other store's pool could still supply the page while the mandated
+		// call sat unread. The rows that are scanned must be these rows.
+		if err := bindsScannedRows(function.Body, query); err != nil {
+			return fmt.Errorf("List%s: %w", family, err)
+		}
+	}
+	return nil
+}
+
+// bindsScannedRows requires the rows the method decodes to be the rows the
+// mandated Query returned.
+func bindsScannedRows(body *ast.BlockStmt, query *ast.CallExpr) error {
+	var rows *ast.Ident
+	ast.Inspect(body, func(node ast.Node) bool {
+		assignment, ok := node.(*ast.AssignStmt)
+		if !ok || len(assignment.Lhs) == 0 || len(assignment.Rhs) == 0 || unparen(assignment.Rhs[0]) != ast.Expr(query) {
+			return true
+		}
+		if identifier, ok := assignment.Lhs[0].(*ast.Ident); ok {
+			rows = identifier
+		}
+		return true
+	})
+	if rows == nil {
+		return fmt.Errorf("the mandated Query result is not bound to a variable, so nothing proves its rows are the ones decoded")
+	}
+	scans := freeCallsNamed(body, "scanRecords")
+	if len(scans) != 1 || len(scans[0].Args) != 1 {
+		return fmt.Errorf("has %d single-argument scanRecords calls, want exactly 1", len(scans))
+	}
+	scanned, ok := unparen(scans[0].Args[0]).(*ast.Ident)
+	if !ok || !sameObject(scanned, rows) {
+		return fmt.Errorf("scanRecords decodes rows that did not come from the mandated Query")
 	}
 	return nil
 }
@@ -1283,32 +1442,6 @@ func storeMethodsNamed(file *ast.File, name string) []storeMethod {
 	return methods
 }
 
-func isPointerToNamed(expression ast.Expr, name string) bool {
-	pointer, ok := unparen(expression).(*ast.StarExpr)
-	if !ok {
-		return false
-	}
-	identifier, ok := unparen(pointer.X).(*ast.Ident)
-	return ok && identifier.Name == name
-}
-
-func selectorCallsNamed(root ast.Node, method string) []*ast.CallExpr {
-	var calls []*ast.CallExpr
-	ast.Inspect(root, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		methodSelector, ok := unparen(call.Fun).(*ast.SelectorExpr)
-		if !ok || methodSelector.Sel.Name != method {
-			return true
-		}
-		calls = append(calls, call)
-		return true
-	})
-	return calls
-}
-
 func isReceiverPoolCall(call *ast.CallExpr, receiver *ast.Ident) bool {
 	methodSelector, ok := unparen(call.Fun).(*ast.SelectorExpr)
 	if !ok || methodSelector.Sel.Name != "Query" {
@@ -1320,38 +1453,6 @@ func isReceiverPoolCall(call *ast.CallExpr, receiver *ast.Ident) bool {
 	}
 	candidate, ok := unparen(poolSelector.X).(*ast.Ident)
 	return ok && sameObject(candidate, receiver)
-}
-
-func sameObject(left, right *ast.Ident) bool {
-	if left == nil || right == nil {
-		return false
-	}
-	if left.Obj != nil || right.Obj != nil {
-		return left.Obj != nil && left.Obj == right.Obj
-	}
-	return left == right
-}
-
-func keyedField(literal *ast.CompositeLit, name string) (ast.Expr, error) {
-	var found ast.Expr
-	for _, element := range literal.Elts {
-		keyValue, ok := element.(*ast.KeyValueExpr)
-		if !ok {
-			continue
-		}
-		key, ok := keyValue.Key.(*ast.Ident)
-		if !ok || key.Name != name {
-			continue
-		}
-		if found != nil {
-			return nil, fmt.Errorf("has duplicate %s fields", name)
-		}
-		found = keyValue.Value
-	}
-	if found == nil {
-		return nil, fmt.Errorf("has no keyed %s field", name)
-	}
-	return found, nil
 }
 
 func orderedQueryCall(expression ast.Expr) (string, *ast.CallExpr, bool) {
@@ -1367,17 +1468,6 @@ func orderedQueryCall(expression ast.Expr) (string, *ast.CallExpr, bool) {
 	return selector.Sel.Name, call, true
 }
 
-func selectorPackage(selector *ast.SelectorExpr) (string, bool) {
-	if selector == nil {
-		return "", false
-	}
-	identifier, ok := unparen(selector.X).(*ast.Ident)
-	if !ok {
-		return "", false
-	}
-	return identifier.Name, true
-}
-
 func isStatementSelector(expression ast.Expr, statement *ast.Ident, field string) bool {
 	selector, ok := unparen(expression).(*ast.SelectorExpr)
 	if !ok || selector.Sel.Name != field {
@@ -1391,21 +1481,6 @@ func isStatementSelector(expression ast.Expr, statement *ast.Ident, field string
 		return statement.Obj != nil && statement.Obj == identifier.Obj
 	}
 	return statement == identifier
-}
-
-func unparen(expression ast.Expr) ast.Expr {
-	for {
-		paren, ok := expression.(*ast.ParenExpr)
-		if !ok {
-			return expression
-		}
-		expression = paren.X
-	}
-}
-
-func isNil(expression ast.Expr) bool {
-	identifier, ok := unparen(expression).(*ast.Ident)
-	return ok && identifier.Name == "nil"
 }
 
 func isNilCursor(expression ast.Expr, family string) bool {
@@ -1425,66 +1500,210 @@ func isNilCursor(expression ast.Expr, family string) bool {
 	return ok && packageOK && packageName == "orderedquery" && selector.Sel.Name == family+"Position"
 }
 
-func isZeroInteger(expression ast.Expr) bool {
-	value, ok := integerConstant(expression)
-	return ok && constant.Sign(value) == 0
-}
-
-func isNonzeroInteger(expression ast.Expr) bool {
-	value, ok := integerConstant(expression)
-	return ok && constant.Sign(value) != 0
-}
-
-func integerConstant(expression ast.Expr) (constant.Value, bool) {
-	literal, ok := unparen(expression).(*ast.BasicLit)
-	if !ok || literal.Kind != token.INT {
-		return nil, false
-	}
-	value := constant.MakeFromLiteral(literal.Value, token.INT, 0)
-	return value, value.Kind() == constant.Int
-}
-
+// TestOrderedIndexMigrationCarriesExactPhysicalIndexes asserts over the indexes
+// declaredOrderedIndexes derives from the migration, rather than over a second
+// hand-written copy of the same definitions. The hand copy is the one that
+// drifts: it agrees with the migration only until someone edits one of them.
 func TestOrderedIndexMigrationCarriesExactPhysicalIndexes(t *testing.T) {
+	t.Parallel()
+	indexes := declaredOrderedIndexes(t)
+	got := make(map[string][]indexColumn)
+	for _, index := range indexes {
+		got[index.name] = index.columns
+	}
+	want := map[string][]indexColumn{
+		"primary key":       {{name: "namespace"}, {name: "ordering_scope"}, {name: "stable_key"}},
+		"ordered_order_idx": {{name: "namespace"}, {name: "ordering_scope"}, {name: "order_id"}, {name: "stable_key"}},
+		"ordered_rank_idx":  {{name: "namespace"}, {name: "ranking_scope"}, {name: "rank_value", descending: true}, {name: "stable_key", descending: true}, {name: "ordering_scope", descending: true}},
+		"ordered_due_idx":   {{name: "namespace"}, {name: "due_state"}, {name: "due_at"}, {name: "stable_key"}, {name: "ordering_scope"}},
+	}
+	for name, columns := range want {
+		if !reflect.DeepEqual(got[name], columns) {
+			t.Errorf("migration declares index %q as %v, want %v", name, got[name], columns)
+		}
+	}
+	for name := range got {
+		if _, expected := want[name]; !expected && name != "primary key" {
+			t.Errorf("migration declares an index %q this guard does not describe; a new access path must be justified here", name)
+		}
+	}
+
 	source, err := os.ReadFile("migrations/0003_ordered_index.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
 	statement := string(source)
-	for _, required := range []string{
-		"stable_key bytea NOT NULL",
-		"PRIMARY KEY (namespace, ordering_scope, stable_key)",
-		"(namespace, ordering_scope, order_id, stable_key)",
-		"(namespace, ranking_scope, rank_value DESC, stable_key DESC, ordering_scope DESC)",
-		"(namespace, due_state, due_at, stable_key, ordering_scope)",
-	} {
-		if !strings.Contains(statement, required) {
-			t.Errorf("OrderedIndex migration lost exact index %q", required)
-		}
-	}
-	if strings.Contains(statement, `stable_key text`) {
-		t.Fatal("OrderedIndex migration cannot represent embedded-NUL StableKeys in PostgreSQL text")
+	if !strings.Contains(statement, "stable_key bytea NOT NULL") || strings.Contains(statement, "stable_key text") {
+		t.Fatal("OrderedIndex migration cannot represent embedded-NUL StableKeys unless stable_key is bytea")
 	}
 	if strings.Contains(statement, "due_state, ordering_scope") {
 		t.Fatal("due index invented a scope filter absent from Storage v0.6.0 ListDue")
 	}
 }
 
+// resolveStringExpression renders the literal parts of a string expression,
+// following package-level string constants and concatenation and standing in
+// U+FFFD for any operand it cannot read. The literal parts are what reaches
+// PostgreSQL; a comment carrying the same words is not.
+func resolveStringExpression(expression ast.Expr, constants map[string]string) string {
+	switch operand := unparen(expression).(type) {
+	case *ast.BasicLit:
+		if operand.Kind != token.STRING {
+			return "\uFFFD"
+		}
+		value, err := strconv.Unquote(operand.Value)
+		if err != nil {
+			return "\uFFFD"
+		}
+		return value
+	case *ast.Ident:
+		if value, ok := constants[operand.Name]; ok {
+			return value
+		}
+		return "\uFFFD"
+	case *ast.BinaryExpr:
+		if operand.Op != token.ADD {
+			return "\uFFFD"
+		}
+		return resolveStringExpression(operand.X, constants) + resolveStringExpression(operand.Y, constants)
+	}
+	return "\uFFFD"
+}
+
+func packageStringConstants(file *ast.File) map[string]string {
+	constants := make(map[string]string)
+	for _, declaration := range file.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok || general.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range general.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok || len(value.Names) != 1 || len(value.Values) != 1 {
+				continue
+			}
+			literal, ok := unparen(value.Values[0]).(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				continue
+			}
+			if unquoted, err := strconv.Unquote(literal.Value); err == nil {
+				constants[value.Names[0].Name] = unquoted
+			}
+		}
+	}
+	return constants
+}
+
+func enclosingFunctionName(file *ast.File, node ast.Node) string {
+	name := "(file scope)"
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Body != nil && nodeContains(function.Body, node) {
+			name = function.Name.Name
+		}
+	}
+	return name
+}
+
+// TestOrderedIndexMutationsPinReadCommittedAndExplicitRowLocks reads the parsed
+// tree, not the raw file. The earlier revision used strings.Count over the
+// source, which this file's own header records as an evadable shape: three real
+// transactions downgraded to RepeatableRead with three copies of the expected
+// string parked in a package comment passed it, and a behaviour-preserving
+// rename of getForUpdate failed it. Both directions are fixed by binding the
+// assertion to the BeginTx options and to the call that carries the lock
+// suffix, rather than to the words used to spell them.
 func TestOrderedIndexMutationsPinReadCommittedAndExplicitRowLocks(t *testing.T) {
-	source, err := os.ReadFile("internal/orderedindex/orderedindex.go")
+	t.Parallel()
+	const path = "internal/orderedindex/orderedindex.go"
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("parse %s: %v", path, err)
 	}
-	text := string(source)
-	if got := strings.Count(text, "IsoLevel: pgx.ReadCommitted"); got != 3 {
-		t.Fatalf("OrderedIndex explicit Read Committed transaction count = %d, want 3", got)
+	constants := packageStringConstants(file)
+
+	transactions := 0
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || callSelectorName(call) != "BeginTx" || len(call.Args) != 2 {
+			return true
+		}
+		transactions++
+		where := enclosingFunctionName(file, call)
+		options, ok := unparen(call.Args[1]).(*ast.CompositeLit)
+		if !ok {
+			t.Errorf("%s: BeginTx options are not a literal, so the isolation level cannot be read here", where)
+			return true
+		}
+		level, err := keyedField(options, "IsoLevel")
+		if err != nil {
+			t.Errorf("%s: BeginTx %v; an ordered mutation must pin its isolation level explicitly rather than inherit the session default", where, err)
+			return true
+		}
+		selector, ok := unparen(level).(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "ReadCommitted" {
+			t.Errorf("%s: BeginTx runs at %s; the ordered mutation protocol serializes on the per-scope counter row and the authoritative record row, so it must run at pgx.ReadCommitted", where, types.ExprString(level))
+		}
+		return true
+	})
+	if transactions != 3 {
+		t.Fatalf("orderedindex opens %d transactions with explicit options, want the three mutation paths (create, update, delete)", transactions)
 	}
-	if strings.Contains(text, "pgx.Serializable") {
-		t.Fatal("OrderedIndex uses Serializable despite its per-scope and per-row lock protocol")
+
+	// The per-scope counter lock, read from the statement that is executed.
+	counterLocks := 0
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || callSelectorName(call) != "QueryRow" || len(call.Args) < 2 {
+			return true
+		}
+		statement := resolveStringExpression(call.Args[1], constants)
+		if strings.Contains(statement, "WHERE namespace = $1 AND ordering_scope = $2 FOR UPDATE") {
+			counterLocks++
+		}
+		return true
+	})
+	if counterLocks != 1 {
+		t.Errorf("orderedindex executes %d statements that lock the per-scope counter row with FOR UPDATE, want exactly 1: concurrent creates in one ordering scope serialize on that row", counterLocks)
 	}
-	if !strings.Contains(text, "WHERE namespace = $1 AND ordering_scope = $2 FOR UPDATE") {
-		t.Fatal("OrderedIndex Create lost its per-scope counter row lock")
+
+	// The shared authoritative-row lock, bound to the call that carries it
+	// rather than to the name of the helper that makes the call.
+	var lockingReaders []string
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Body == nil {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok || callSelectorName(call) != "getFrom" || len(call.Args) != 4 {
+				return true
+			}
+			if strings.Contains(resolveStringExpression(call.Args[3], constants), "FOR UPDATE") {
+				lockingReaders = append(lockingReaders, function.Name.Name)
+			}
+			return true
+		})
 	}
-	if !strings.Contains(text, `return s.getFrom(ctx, tx, id, " FOR UPDATE")`) {
-		t.Fatal("OrderedIndex Update/Delete lost their shared authoritative-row lock")
+	if len(lockingReaders) != 1 {
+		t.Fatalf("orderedindex has %d row readers that append FOR UPDATE (%s), want exactly 1 shared by update and delete", len(lockingReaders), strings.Join(lockingReaders, ", "))
+	}
+	for _, mutation := range []string{"updateOnce", "deleteOnce"} {
+		functions := freeFunctionsNamed(file, mutation)
+		methods := storeMethodsNamed(file, mutation)
+		var body *ast.BlockStmt
+		switch {
+		case len(methods) == 1:
+			body = methods[0].function.Body
+		case len(functions) == 1:
+			body = functions[0].Body
+		default:
+			t.Errorf("orderedindex has no single %s to check for the authoritative row lock", mutation)
+			continue
+		}
+		if len(selectorCallsNamed(body, lockingReaders[0])) != 1 {
+			t.Errorf("%s does not read its record through %s, the one reader that takes the authoritative row lock; without it a concurrent revision check is not serialized", mutation, lockingReaders[0])
+		}
 	}
 }
