@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/looprig/pgstore/internal/orderedquery"
 	pginternal "github.com/looprig/pgstore/internal/postgres"
 )
 
@@ -54,23 +56,26 @@ FROM generate_series(1, 10000) AS g`)
 	tests := []struct {
 		name      string
 		indexName string
-		query     string
-		args      []any
+		statement orderedquery.Statement
+		wantArgs  []any
 	}{
-		{name: "order first", indexName: prefix + "ordered_order_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND ordering_scope=$2 AND order_id > $3::numeric ORDER BY order_id ASC, stable_key ASC LIMIT 25`, args: []any{"sessions", "scope-1", "0"}},
-		{name: "order middle", indexName: prefix + "ordered_order_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND ordering_scope=$2 AND order_id > $3::numeric ORDER BY order_id ASC, stable_key ASC LIMIT 25`, args: []any{"sessions", "scope-1", "500"}},
-		{name: "rank first", indexName: prefix + "ordered_rank_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND ranking_scope=$2 AND ranked AND NOT deleted ORDER BY rank_value DESC, stable_key DESC, ordering_scope DESC LIMIT 25`, args: []any{"sessions", "workers"}},
-		{name: "rank middle", indexName: prefix + "ordered_rank_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND ranking_scope=$2 AND ranked AND NOT deleted AND (rank_value,stable_key,ordering_scope) < ($3,$4,$5) ORDER BY rank_value DESC, stable_key DESC, ordering_scope DESC LIMIT 25`, args: []any{"sessions", "workers", int64(50), []byte("key-000500"), "scope-5"}},
+		{name: "order first", indexName: prefix + "ordered_order_idx", statement: orderedquery.Ordered(table, "sessions", "scope-1", 0, 25), wantArgs: []any{"sessions", "scope-1", "0", 25}},
+		{name: "order middle", indexName: prefix + "ordered_order_idx", statement: orderedquery.Ordered(table, "sessions", "scope-1", 500, 25), wantArgs: []any{"sessions", "scope-1", "500", 25}},
+		{name: "rank first", indexName: prefix + "ordered_rank_idx", statement: orderedquery.Ranked(table, "sessions", "workers", nil, 24), wantArgs: []any{"sessions", "workers", 25}},
+		{name: "rank middle", indexName: prefix + "ordered_rank_idx", statement: orderedquery.Ranked(table, "sessions", "workers", &orderedquery.RankedPosition{Rank: 50, StableKey: []byte("key-000500"), OrderingScope: "scope-5"}, 24), wantArgs: []any{"sessions", "workers", int64(50), []byte("key-000500"), "scope-5", 25}},
 		// Storage v0.6.0 ListDue has no scope argument. Both pages must use the
 		// namespace+state+due tuple index, proving the runbook shorthand was not
 		// accidentally implemented as an API-incompatible scope filter.
-		{name: "due first no invented scope", indexName: prefix + "ordered_due_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND due_state=1 AND NOT deleted AND due_at <= $2 ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT 25`, args: []any{"sessions", int64(999)}},
-		{name: "due middle no invented scope", indexName: prefix + "ordered_due_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND due_state=1 AND NOT deleted AND due_at <= $2 AND (due_at,stable_key,ordering_scope) > ($3,$4,$5) ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT 25`, args: []any{"sessions", int64(999), int64(500), []byte("key-000500"), "scope-5"}},
+		{name: "due first no invented scope", indexName: prefix + "ordered_due_idx", statement: orderedquery.Due(table, "sessions", 999, nil, 24), wantArgs: []any{"sessions", int64(999), 25}},
+		{name: "due middle no invented scope", indexName: prefix + "ordered_due_idx", statement: orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{DueAt: 500, StableKey: []byte("key-000500"), OrderingScope: "scope-5"}, 24), wantArgs: []any{"sessions", int64(999), int64(500), []byte("key-000500"), "scope-5", 25}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			if !reflect.DeepEqual(test.statement.Args, test.wantArgs) {
+				t.Fatalf("production query arguments = %#v, want exact values/types/order %#v", test.statement.Args, test.wantArgs)
+			}
 			var raw []byte
-			if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.query, test.args...).Scan(&raw); err != nil {
+			if err := tx.QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+test.statement.SQL, test.statement.Args...).Scan(&raw); err != nil {
 				t.Fatalf("EXPLAIN: %v", err)
 			}
 			var plan any
@@ -107,8 +112,6 @@ func planHasNodeType(node any, expected string) bool {
 	}
 	return false
 }
-
-const orderedExplainColumns = "namespace, ordering_scope, stable_key, ranking_scope, revision, order_id, value, value_is_nil, ranked, rank_value, due_state, due_at, deleted"
 
 func planUsesIndex(node any, expected string) bool {
 	switch value := node.(type) {

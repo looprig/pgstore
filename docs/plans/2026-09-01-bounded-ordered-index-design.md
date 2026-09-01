@@ -67,6 +67,14 @@ ListDue uses the ascending `(due_at, stable_key, ordering_scope)` keyset within 
 namespace and fixed due bound. There is no OFFSET, historical scan, KV fallback, or
 in-memory global sort.
 
+The three page statements and their ordered bound arguments are constructed by one
+internal package used by both production and the tagged EXPLAIN gate. The plan gate
+therefore executes the exact first/middle-page SQL rather than a hand-copied facsimile.
+ListOrdered qualifies the physical numeric `order_id` in its `ORDER BY`: the selected
+value is cast to text for lossless unsigned decoding, and an unqualified name would
+otherwise make PostgreSQL sort by that text output expression instead of walking the
+numeric B-tree order.
+
 Ranked and due cursors are bounded base64url-encoded versioned JSON envelopes. They
 bind kind, namespace, ranking scope or due bound, and the complete last tuple.
 Decoding enforces encoded and decoded ceilings, exact field shape, canonical JSON,
@@ -90,4 +98,5 @@ explicit-isolation/lock guards, concurrent Update/Delete CAS tests,
 and tagged EXPLAIN ANALYZE assertions at representative cardinality for first and
 middle order/rank/due pages. Verification includes unit and integration race tests,
 PgBouncer transaction mode, mutation testing, `make check`, vulnerability scanning,
-and tidy/diff cleanliness.
+and tidy/diff cleanliness. Production SQL and bound-argument mutations must be killed
+by the named EXPLAIN gate, including argument value, dynamic type, and order drift.

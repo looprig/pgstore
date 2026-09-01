@@ -7,11 +7,16 @@ import (
 )
 
 func TestOrderedIndexQueriesRemainIndexBackedKeysets(t *testing.T) {
-	source, err := os.ReadFile("internal/orderedindex/orderedindex.go")
+	implementation, err := os.ReadFile("internal/orderedindex/orderedindex.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	lower := strings.ToLower(string(source))
+	queries, err := os.ReadFile("internal/orderedquery/orderedquery.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(implementation) + "\n" + string(queries)
+	lower := strings.ToLower(source)
 	for _, forbidden := range []string{" offset ", "internal/kv", "sort.", "pg_advisory"} {
 		if strings.Contains(lower, forbidden) {
 			t.Errorf("OrderedIndex production source contains forbidden scan/fallback mechanism %q", forbidden)
@@ -24,8 +29,36 @@ func TestOrderedIndexQueriesRemainIndexBackedKeysets(t *testing.T) {
 		"ORDER BY rank_value DESC, stable_key DESC, ordering_scope DESC",
 		"ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC",
 	} {
-		if !strings.Contains(string(source), required) {
+		if !strings.Contains(source, required) {
 			t.Errorf("OrderedIndex source lost required keyset fragment %q", required)
+		}
+	}
+}
+
+func TestOrderedIndexPlanGateUsesProductionStatements(t *testing.T) {
+	production, err := os.ReadFile("internal/orderedindex/orderedindex.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	planGate, err := os.ReadFile("orderedindex_plan_integration_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, copiedSQL := range []string{
+		"order_id > $3::numeric",
+		"ranking_scope=$2 AND ranked",
+		"due_state=1 AND NOT deleted",
+	} {
+		if strings.Contains(string(planGate), copiedSQL) {
+			t.Errorf("ordered plan gate duplicates production SQL fragment %q", copiedSQL)
+		}
+	}
+	for _, builder := range []string{"orderedquery.Ordered(", "orderedquery.Ranked(", "orderedquery.Due("} {
+		if !strings.Contains(string(production), builder) {
+			t.Errorf("OrderedIndex production does not use shared statement builder %q", builder)
+		}
+		if !strings.Contains(string(planGate), builder) {
+			t.Errorf("ordered plan gate does not use shared statement builder %q", builder)
 		}
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/looprig/pgstore/internal/guard"
+	"github.com/looprig/pgstore/internal/orderedquery"
 	pginternal "github.com/looprig/pgstore/internal/postgres"
 	"github.com/looprig/storage"
 )
@@ -322,7 +323,8 @@ func (s *Store) ListOrdered(ctx context.Context, namespace, orderingScope string
 	if err := storage.ValidateOrderedLimit(limit); err != nil {
 		return storage.OrderedPage{}, err
 	}
-	rows, err := s.pool.Query(ctx, "SELECT "+recordColumns+" FROM "+s.recordsTable()+" WHERE namespace = $1 AND ordering_scope = $2 AND order_id > $3::numeric ORDER BY order_id ASC, stable_key ASC LIMIT $4", namespace, orderingScope, strconv.FormatUint(afterOrder, 10), limit)
+	statement := orderedquery.Ordered(s.recordsTable(), namespace, orderingScope, afterOrder, limit)
+	rows, err := s.pool.Query(ctx, statement.SQL, statement.Args...)
 	if err != nil {
 		return storage.OrderedPage{}, failure(ctx, "ordered list order")
 	}
@@ -354,14 +356,12 @@ func (s *Store) ListRanked(ctx context.Context, namespace, rankingScope string, 
 	if err != nil {
 		return storage.RankedPage{}, err
 	}
-	query, args := "SELECT "+recordColumns+" FROM "+s.recordsTable()+" WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted", []any{namespace, rankingScope}
+	var queryPosition *orderedquery.RankedPosition
 	if hasPosition {
-		query += " AND (rank_value, stable_key, ordering_scope) < ($3, $4, $5)"
-		args = append(args, position.rank, stableKeyBytes(position.stableKey), position.orderingScope)
+		queryPosition = &orderedquery.RankedPosition{Rank: position.rank, StableKey: stableKeyBytes(position.stableKey), OrderingScope: position.orderingScope}
 	}
-	query += " ORDER BY rank_value DESC, stable_key DESC, ordering_scope DESC LIMIT $" + strconv.Itoa(len(args)+1)
-	args = append(args, limit+1)
-	rows, err := s.pool.Query(ctx, query, args...)
+	statement := orderedquery.Ranked(s.recordsTable(), namespace, rankingScope, queryPosition, limit)
+	rows, err := s.pool.Query(ctx, statement.SQL, statement.Args...)
 	if err != nil {
 		return storage.RankedPage{}, failure(ctx, "ordered list ranked")
 	}
@@ -393,14 +393,12 @@ func (s *Store) ListDue(ctx context.Context, namespace string, dueAtOrBefore int
 	if err != nil {
 		return storage.DuePage{}, err
 	}
-	query, args := "SELECT "+recordColumns+" FROM "+s.recordsTable()+" WHERE namespace = $1 AND due_state = 1 AND NOT deleted AND due_at <= $2", []any{namespace, dueAtOrBefore}
+	var queryPosition *orderedquery.DuePosition
 	if hasPosition {
-		query += " AND (due_at, stable_key, ordering_scope) > ($3, $4, $5)"
-		args = append(args, position.dueAt, stableKeyBytes(position.stableKey), position.orderingScope)
+		queryPosition = &orderedquery.DuePosition{DueAt: position.dueAt, StableKey: stableKeyBytes(position.stableKey), OrderingScope: position.orderingScope}
 	}
-	query += " ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT $" + strconv.Itoa(len(args)+1)
-	args = append(args, limit+1)
-	rows, err := s.pool.Query(ctx, query, args...)
+	statement := orderedquery.Due(s.recordsTable(), namespace, dueAtOrBefore, queryPosition, limit)
+	rows, err := s.pool.Query(ctx, statement.SQL, statement.Args...)
 	if err != nil {
 		return storage.DuePage{}, failure(ctx, "ordered list due")
 	}
@@ -418,8 +416,6 @@ func (s *Store) ListDue(ctx context.Context, namespace string, dueAtOrBefore int
 	return page, nil
 }
 
-const recordColumns = "namespace, ordering_scope, stable_key, ranking_scope, revision::text, order_id::text, value, value_is_nil, ranked, rank_value, due_state, due_at, deleted"
-
 type rowScanner interface{ Scan(...any) error }
 type queryRower interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
@@ -429,7 +425,7 @@ func (s *Store) get(ctx context.Context, id storage.OrderedID) (storage.OrderedR
 	return s.getFrom(ctx, s.pool, id, "")
 }
 func (s *Store) getFrom(ctx context.Context, queryer queryRower, id storage.OrderedID, suffix string) (storage.OrderedRecord, error) {
-	return scanRecord(queryer.QueryRow(ctx, "SELECT "+recordColumns+" FROM "+s.recordsTable()+" WHERE namespace = $1 AND ordering_scope = $2 AND stable_key = $3"+suffix, id.Namespace, id.OrderingScope, stableKeyBytes(id.StableKey)))
+	return scanRecord(queryer.QueryRow(ctx, "SELECT "+orderedquery.RecordColumns+" FROM "+s.recordsTable()+" WHERE namespace = $1 AND ordering_scope = $2 AND stable_key = $3"+suffix, id.Namespace, id.OrderingScope, stableKeyBytes(id.StableKey)))
 }
 
 func (s *Store) getForUpdate(ctx context.Context, tx pgx.Tx, id storage.OrderedID) (storage.OrderedRecord, error) {
