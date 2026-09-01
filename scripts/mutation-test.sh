@@ -2,7 +2,7 @@
 set -eu
 
 snapshot_dir="/private/tmp/pgstore-mutation-snapshot-${UID:-codex}"
-files="go.mod options.go pgstore.go migrations.go migrations/0002_leases.sql internal/guard/guard.go internal/postgres/postgres.go internal/ledger/ledger.go internal/lease/lease.go internal/kv/kv.go internal/orderedindex/orderedindex.go conformance_integration_test.go"
+files="go.mod options.go pgstore.go migrations.go migrations/0002_leases.sql migrations/0003_ordered_index.sql internal/guard/guard.go internal/postgres/postgres.go internal/ledger/ledger.go internal/lease/lease.go internal/kv/kv.go internal/orderedindex/orderedindex.go conformance_integration_test.go"
 
 restore_snapshot() {
 	for snapshot_file in $files; do
@@ -216,11 +216,39 @@ run_integration_mutation "kv CAS revision predicate" internal/kv/kv.go ' WHERE k
 run_integration_mutation "kv prefix parameterization" internal/kv/kv.go '"SELECT key FROM "+s.table()+" WHERE left(key, length($1)) = $1 ORDER BY key COLLATE \"C\"", prefix' '"SELECT key FROM "+s.table()+" WHERE left(key, length('"'"'"+prefix+"'"'"')) = '"'"'"+prefix+"'"'"' ORDER BY key COLLATE \"C\""' TestKVKeysPrefixIsDataNotSQL 'Keys with SQL-shaped prefix:'
 run_mutation "kv bytewise collation" internal/kv/kv.go 'ORDER BY key COLLATE \"C\"' 'ORDER BY key' TestKVKeysPinsBytewiseCollation 'does not pin ORDER BY'
 
+# P1.4 OrderedIndex behavioral mutation matrix.
+run_integration_mutation "ordered counter increment" internal/orderedindex/orderedindex.go 'SET next_order = next_order + 1 WHERE namespace' 'SET next_order = next_order + 0 WHERE namespace' TestOrderedIndexConformance 'want record, true, nil'
+run_integration_mutation "ordered duplicate recheck after counter lock" internal/orderedindex/orderedindex.go 'if lockedExisting, readErr := s.getFrom(ctx, tx, id, ""); readErr == nil {' 'if lockedExisting, readErr := s.getFrom(ctx, tx, id, ""); false && readErr == nil {' TestConcurrentDuplicateConsumesExactlyOneCounterValue 'concurrent duplicate'
+run_integration_mutation "ordered atomic rank move" internal/orderedindex/orderedindex.go 'ranked = $6, rank_value = $7' 'ranked = NOT $6, rank_value = $7' TestOrderedIndexConformance 'Rank false/99'
+run_integration_mutation "ordered atomic due move" internal/orderedindex/orderedindex.go 'due_state = $8, due_at = $9' 'due_state = $8, due_at = $9 + 1' TestOrderedIndexConformance 'Due 1/-4'
+run_integration_mutation "ordered order keyset direction" internal/orderedindex/orderedindex.go 'order_id > $3::numeric' 'order_id < $3::numeric' TestOrderedIndexConformance 'ListOrdered'
+run_integration_mutation "ordered ranked keyset direction" internal/orderedindex/orderedindex.go '(rank_value, stable_key, ordering_scope) < ($3, $4, $5)' '(rank_value, stable_key, ordering_scope) > ($3, $4, $5)' TestOrderedIndexConformance 'ListRanked'
+run_integration_mutation "ordered due keyset direction" internal/orderedindex/orderedindex.go '(due_at, stable_key, ordering_scope) > ($3, $4, $5)' '(due_at, stable_key, ordering_scope) < ($3, $4, $5)' TestOrderedIndexConformance 'ListDue'
+run_mutation "ordered ranked total tie break" internal/orderedindex/orderedindex.go 'ORDER BY rank_value DESC, stable_key DESC, ordering_scope DESC' 'ORDER BY rank_value DESC, stable_key DESC' TestOrderedIndexQueriesRemainIndexBackedKeysets 'lost required keyset fragment'
+run_mutation "ordered due total tie break" internal/orderedindex/orderedindex.go 'ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC' 'ORDER BY due_at ASC, stable_key ASC' TestOrderedIndexQueriesRemainIndexBackedKeysets 'lost required keyset fragment'
+run_integration_mutation "ordered delete tombstone" internal/orderedindex/orderedindex.go 'due_at = 0, deleted = true WHERE namespace' 'due_at = 0, deleted = false WHERE namespace' TestOrderedIndexConformance 'omitted its tombstone state'
+run_integration_mutation "ordered delete clears rank" internal/orderedindex/orderedindex.go 'ranked = false, rank_value = 0' 'ranked = ranked, rank_value = rank_value' TestOrderedIndexConformance 'Delete('
+run_mutation "ordered cursor canonical encoding" internal/orderedindex/orderedindex.go '!bytes.Equal(canonical, raw)' 'false && !bytes.Equal(canonical, raw)' TestCursorDecoderRejectsOversizeAndNoncanonicalTokens 'want ranked malformed cursor'
+run_mutation "ordered cursor version" internal/orderedindex/orderedindex.go 'if *header.Version != cursorVersion {' 'if false && *header.Version != cursorVersion {' TestCursorDecoderClassifiesVersionKindAndQueryBeforeUse 'want ranked/unknown version'
+run_mutation "ordered ranked cursor query binding" internal/orderedindex/orderedindex.go 'envelope.RankingScope != scope' 'false && envelope.RankingScope != scope' TestCursorDecoderClassifiesVersionKindAndQueryBeforeUse 'want ranked/query mismatch'
+run_mutation "ordered due cursor bound binding" internal/orderedindex/orderedindex.go '*envelope.DueBound != bound' 'false && *envelope.DueBound != bound' TestCursorDecoderClassifiesVersionKindAndQueryBeforeUse 'want due/query mismatch'
+run_integration_mutation "ordered ambiguity rejects later revision" internal/orderedindex/orderedindex.go 'return recordsEqual(got, want)' 'return true' TestCommitAcknowledgementLossResolvesOnlyExactPostState 'want update ambiguity'
+run_integration_mutation "ordered ranked namespace isolation" internal/orderedindex/orderedindex.go 'WHERE namespace = $1 AND ranking_scope = $2' 'WHERE ranking_scope = $2' TestListViewsIsolateNamespaceAndOrderingScope 'namespace isolation'
+run_integration_mutation "ordered due namespace isolation" internal/orderedindex/orderedindex.go 'WHERE namespace = $1 AND due_state = 1' 'WHERE due_state = 1' TestListViewsIsolateNamespaceAndOrderingScope 'namespace isolation'
+run_integration_mutation "ordered migration direct identity" migrations/0003_ordered_index.sql 'PRIMARY KEY (namespace, ordering_scope, stable_key),' 'UNIQUE (namespace, ordering_scope, stable_key),' TestMigrationAddsOrderedIndexTablesAndExactIndexes 'index exact_ordered_records_pkey'
+run_integration_mutation "ordered migration canonical due" migrations/0003_ordered_index.sql 'CHECK ((due_state = 0 AND due_at = 0) OR due_state = 1),' 'CHECK (true),' TestMigrationAddsOrderedIndexTablesAndExactIndexes 'accepted noncanonical due'
+run_integration_mutation "ordered migration tombstone constraint" migrations/0003_ordered_index.sql 'CHECK (NOT deleted OR (NOT ranked AND due_state = 0 AND due_at = 0))' 'CHECK (true)' TestMigrationAddsOrderedIndexTablesAndExactIndexes 'accepted active tombstone'
+run_integration_mutation "ordered migration value bound" migrations/0003_ordered_index.sql 'octet_length(value) <= 1048576' 'octet_length(value) <= 1048577' TestMigrationAddsOrderedIndexTablesAndExactIndexes 'accepted oversized value'
+run_integration_mutation "ordered intended rank plan" migrations/0003_ordered_index.sql 'rank_value DESC, stable_key DESC, ordering_scope DESC' 'rank_value ASC, stable_key DESC, ordering_scope DESC' TestOrderedIndexPlansUseExactKeysetIndexesForFirstAndMiddlePages 'required an explicit sort'
+run_integration_mutation "ordered due index has no invented scope" migrations/0003_ordered_index.sql 'namespace, due_state, due_at, stable_key, ordering_scope' 'namespace, due_state, ordering_scope, due_at, stable_key' TestOrderedIndexPlansUseExactKeysetIndexesForFirstAndMiddlePages 'did not select intended index'
+run_integration_mutation "ordered get leaks bare password" internal/orderedindex/orderedindex.go 'return storage.OrderedRecord{}, failure(ctx, "ordered get")' 'return storage.OrderedRecord{}, pginternal.RedactedError("ordered get "+s.pool.Config().ConnConfig.Password)' TestOperationErrorsDoNotDiscloseDSNOrCredential 'OrderedIndex.Get error disclosed'
+run_integration_mutation "ordered create leaks bare password" internal/orderedindex/orderedindex.go 'return storage.OrderedRecord{}, false, failure(ctx, "ordered create lookup")' 'return storage.OrderedRecord{}, false, pginternal.RedactedError("ordered create "+s.pool.Config().ConnConfig.Password)' TestOperationErrorsDoNotDiscloseDSNOrCredential 'OrderedIndex.Create error disclosed'
+run_integration_mutation "ordered ranked list leaks bare password" internal/orderedindex/orderedindex.go 'return storage.RankedPage{}, failure(ctx, "ordered list ranked")' 'return storage.RankedPage{}, pginternal.RedactedError("ordered ranked "+s.pool.Config().ConnConfig.Password)' TestOperationErrorsDoNotDiscloseDSNOrCredential 'OrderedIndex.ListRanked error disclosed'
+run_integration_mutation "ordered due list leaks bare password" internal/orderedindex/orderedindex.go 'return storage.DuePage{}, failure(ctx, "ordered list due")' 'return storage.DuePage{}, pginternal.RedactedError("ordered due "+s.pool.Config().ConnConfig.Password)' TestOperationErrorsDoNotDiscloseDSNOrCredential 'OrderedIndex.ListDue error disclosed'
+
 # Seam invariant: an unimplemented operation may never return a nil or zero
 # value without an error. The guard derives the unimplemented set, so the
 # derivation is mutated here too, not just the operations.
-run_mutation "OrderedIndex.Create returns zero, true, nil" internal/orderedindex/orderedindex.go 'return storage.OrderedRecord{}, false, guard.NotImplemented("OrderedIndex.Create")' 'return storage.OrderedRecord{}, true, nil' TestSeamOperationsReturnNotImplemented 'does not call guard.NotImplemented'
-run_mutation "OrderedIndex.Delete returns zero, nil" internal/orderedindex/orderedindex.go 'return storage.OrderedRecord{}, guard.NotImplemented("OrderedIndex.Delete")' 'return storage.OrderedRecord{}, nil' TestSeamOperationsReturnNotImplemented 'does not call guard.NotImplemented'
 run_mutation "implemented KV.Get claims NotImplemented" internal/kv/kv.go 'return nil, 0, &storage.KeyNotFoundError{Key: key}' 'return nil, 0, guard.NotImplemented("KV.Get")' TestSeamOperationsReturnNotImplemented 'calls guard.NotImplemented although KV conformance runs'
 # The derivation must not be able to lose an input silently. Deleting the
 # interface assertion compiles, because Open still assigns the concrete store to

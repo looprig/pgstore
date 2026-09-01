@@ -175,6 +175,34 @@ func TestOperationErrorsDoNotDiscloseDSNOrCredential(t *testing.T) {
 			return err
 		},
 		"KV.Delete": func() error { return store.KV.Delete(ctx, "sessions/closed") },
+		"OrderedIndex.Get": func() error {
+			_, err := store.OrderedIndex.Get(ctx, storage.OrderedID{Namespace: "sessions", OrderingScope: "closed", StableKey: "key"})
+			return err
+		},
+		"OrderedIndex.Create": func() error {
+			_, _, err := store.OrderedIndex.Create(ctx, storage.OrderedID{Namespace: "sessions", OrderingScope: "closed", StableKey: "key"}, "workers", []byte("x"), storage.Rank{}, storage.Due{State: storage.NotDue})
+			return err
+		},
+		"OrderedIndex.Update": func() error {
+			_, err := store.OrderedIndex.Update(ctx, storage.OrderedID{Namespace: "sessions", OrderingScope: "closed", StableKey: "key"}, 1, []byte("x"), storage.Rank{}, storage.Due{State: storage.NotDue})
+			return err
+		},
+		"OrderedIndex.Delete": func() error {
+			_, err := store.OrderedIndex.Delete(ctx, storage.OrderedID{Namespace: "sessions", OrderingScope: "closed", StableKey: "key"}, 1)
+			return err
+		},
+		"OrderedIndex.ListOrdered": func() error {
+			_, err := store.OrderedIndex.ListOrdered(ctx, "sessions", "closed", 0, 1)
+			return err
+		},
+		"OrderedIndex.ListRanked": func() error {
+			_, err := store.OrderedIndex.ListRanked(ctx, "sessions", "workers", "", 1)
+			return err
+		},
+		"OrderedIndex.ListDue": func() error {
+			_, err := store.OrderedIndex.ListDue(ctx, "sessions", 0, "", 1)
+			return err
+		},
 	}
 	for _, name := range slices.Sorted(maps.Keys(operations)) {
 		err := operations[name]()

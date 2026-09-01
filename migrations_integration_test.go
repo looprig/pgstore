@@ -94,9 +94,87 @@ func TestMigrationAddsLeaseTable(t *testing.T) {
 	if err := admin.QueryRow(ctx, "SELECT count(*) FROM migrationlease.fresh_schema_migrations").Scan(&versions); err != nil {
 		t.Fatalf("count migration versions: %v", err)
 	}
-	if versions != 2 {
-		t.Fatalf("migration version rows = %d, want 2", versions)
+	if versions != 3 {
+		t.Fatalf("migration version rows = %d, want 3", versions)
 	}
+}
+
+func TestMigrationAddsOrderedIndexTablesAndExactIndexes(t *testing.T) {
+	admin := adminPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := admin.Exec(ctx, "DROP SCHEMA IF EXISTS migrationordered CASCADE"); err != nil {
+		t.Fatalf("drop schema: %v", err)
+	}
+	store, err := Open(ctx, Options{DSN: os.Getenv("PGSTORE_TEST_DSN"), Schema: "migrationordered", TablePrefix: "exact_", Migrations: MigrationApply, AllowInsecureLocalhostOnly: true})
+	if err != nil {
+		t.Fatalf("Open with migration apply: %v", err)
+	}
+	store.Close()
+
+	for _, table := range []string{"exact_ordered_scopes", "exact_ordered_records"} {
+		var exists bool
+		if err := admin.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", "migrationordered."+table).Scan(&exists); err != nil {
+			t.Fatalf("find %s: %v", table, err)
+		}
+		if !exists {
+			t.Errorf("migration did not create %s", table)
+		}
+	}
+
+	wantIndexes := map[string]string{
+		"exact_ordered_records_pkey": "namespace, ordering_scope, stable_key",
+		"exact_ordered_order_idx":    "namespace, ordering_scope, order_id, stable_key",
+		"exact_ordered_rank_idx":     "namespace, ranking_scope, rank_value, stable_key, ordering_scope",
+		// ListDue has no scope parameter. This exact shape deliberately resolves
+		// the runbook shorthand in favor of Storage v0.6.0's released API and
+		// complete due tuple.
+		"exact_ordered_due_idx": "namespace, due_state, due_at, stable_key, ordering_scope",
+	}
+	rows, err := admin.Query(ctx, `SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'migrationordered' AND tablename = 'exact_ordered_records'`)
+	if err != nil {
+		t.Fatalf("query ordered indexes: %v", err)
+	}
+	defer rows.Close()
+	got := make(map[string]string)
+	for rows.Next() {
+		var name, definition string
+		if err := rows.Scan(&name, &definition); err != nil {
+			t.Fatalf("scan ordered index: %v", err)
+		}
+		got[name] = definition
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate ordered indexes: %v", err)
+	}
+	for name, columns := range wantIndexes {
+		definition, ok := got[name]
+		if !ok || !indexDefinitionContainsColumns(definition, columns) {
+			t.Errorf("index %s = %q, want columns (%s)", name, definition, columns)
+		}
+	}
+	recordTable := `migrationordered.exact_ordered_records`
+	invalidRows := []struct {
+		name string
+		sql  string
+	}{
+		{name: "negative counter", sql: `INSERT INTO migrationordered.exact_ordered_scopes VALUES ('sessions','bad-counter',-1)`},
+		{name: "zero revision", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope','zero-revision','workers',0,1,''::bytea,false,false,0,0,0,false)`},
+		{name: "zero order", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope','zero-order','workers',1,0,''::bytea,false,false,0,0,0,false)`},
+		{name: "oversized value", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope','large','workers',1,1,decode(repeat('00',1048577),'hex'),false,false,0,0,0,false)`},
+		{name: "noncanonical due", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope','bad-due','workers',1,1,''::bytea,false,false,0,0,1,false)`},
+		{name: "active tombstone", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope','bad-delete','workers',1,1,''::bytea,false,true,1,1,1,true)`},
+	}
+	for _, invalid := range invalidRows {
+		if _, err := admin.Exec(ctx, invalid.sql); err == nil {
+			t.Errorf("migration constraints accepted %s", invalid.name)
+		}
+	}
+}
+
+func indexDefinitionContainsColumns(definition, columns string) bool {
+	normalized := strings.NewReplacer(`"`, "", " ASC", "", " DESC", "").Replace(definition)
+	return strings.Contains(normalized, "("+columns+")")
 }
 
 func TestMigrationUpgradesVersionOneWithoutDataLoss(t *testing.T) {
@@ -134,8 +212,45 @@ INSERT INTO migrationupgrade.old_kv (key, revision, value) VALUES ('sessions/kep
 	if err := admin.QueryRow(ctx, "SELECT count(*) FROM migrationupgrade.old_schema_migrations").Scan(&versions); err != nil {
 		t.Fatalf("count migration versions: %v", err)
 	}
-	if versions != 2 {
-		t.Fatalf("migration version rows = %d, want 2", versions)
+	if versions != 3 {
+		t.Fatalf("migration version rows = %d, want 3", versions)
+	}
+}
+
+func TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss(t *testing.T) {
+	admin := adminPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := admin.Exec(ctx, `DROP SCHEMA IF EXISTS migrationv2 CASCADE;
+CREATE SCHEMA migrationv2;
+CREATE TABLE migrationv2.old_schema_migrations (version bigint PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
+INSERT INTO migrationv2.old_schema_migrations (version) VALUES (1), (2);
+CREATE TABLE migrationv2.old_ledger_scopes (name text PRIMARY KEY, tip bigint NOT NULL CHECK (tip >= 0));
+CREATE TABLE migrationv2.old_ledger_records (name text NOT NULL REFERENCES migrationv2.old_ledger_scopes(name) ON DELETE CASCADE, seq bigint NOT NULL CHECK (seq > 0), payload bytea NOT NULL, PRIMARY KEY (name, seq));
+CREATE TABLE migrationv2.old_kv (key text PRIMARY KEY, revision bigint NOT NULL CHECK (revision > 0), value bytea NOT NULL);
+CREATE TABLE migrationv2.old_leases (name text PRIMARY KEY, epoch bigint NOT NULL CHECK (epoch >= 0), holder bytea, expires_at timestamptz, revision bigint NOT NULL CHECK (revision >= 0), CHECK ((holder IS NULL) = (expires_at IS NULL)));
+INSERT INTO migrationv2.old_kv (key, revision, value) VALUES ('sessions/kept-v2', 9, convert_to('kept', 'UTF8'));
+INSERT INTO migrationv2.old_leases (name, epoch, holder, expires_at, revision) VALUES ('sessions/lease', 7, NULL, NULL, 3);`); err != nil {
+		t.Fatalf("seed version two schema: %v", err)
+	}
+	store, err := Open(ctx, Options{DSN: os.Getenv("PGSTORE_TEST_DSN"), Schema: "migrationv2", TablePrefix: "old_", Migrations: MigrationApply, AllowInsecureLocalhostOnly: true})
+	if err != nil {
+		t.Fatalf("Open version two schema: %v", err)
+	}
+	defer store.Close()
+	value, revision, err := store.KV.Get(ctx, "sessions/kept-v2")
+	if err != nil || string(value) != "kept" || revision != 9 {
+		t.Fatalf("preserved v2 KV = (%q, %d, %v), want (kept, 9, nil)", value, revision, err)
+	}
+	var epoch, leaseRevision uint64
+	if err := admin.QueryRow(ctx, `SELECT epoch, revision FROM migrationv2.old_leases WHERE name='sessions/lease'`).Scan(&epoch, &leaseRevision); err != nil || epoch != 7 || leaseRevision != 3 {
+		t.Fatalf("preserved v2 lease = (%d, %d, %v), want (7, 3, nil)", epoch, leaseRevision, err)
+	}
+	for _, table := range []string{"old_ordered_scopes", "old_ordered_records"} {
+		var exists bool
+		if err := admin.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", "migrationv2."+table).Scan(&exists); err != nil || !exists {
+			t.Errorf("upgraded table %s exists = %v, err %v", table, exists, err)
+		}
 	}
 }
 
@@ -188,8 +303,8 @@ func TestConcurrentMigrationOwnersSerializeFromVersionZero(t *testing.T) {
 		if err := admin.QueryRow(ctx, "SELECT count(*) FROM migrationrace."+table).Scan(&versions); err != nil {
 			t.Fatalf("read %s: %v", table, err)
 		}
-		if versions != 2 {
-			t.Fatalf("%s version rows = %d, want 2", table, versions)
+		if versions != 3 {
+			t.Fatalf("%s version rows = %d, want 3", table, versions)
 		}
 	}
 }
@@ -236,7 +351,7 @@ func TestMigrationRefusesASchemaNewerThanThisBuild(t *testing.T) {
 	if _, err := admin.Exec(ctx, `DROP SCHEMA IF EXISTS downgrade CASCADE;
 CREATE SCHEMA downgrade;
 CREATE TABLE downgrade.future_schema_migrations (version bigint PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
-INSERT INTO downgrade.future_schema_migrations (version) VALUES (3);`); err != nil {
+INSERT INTO downgrade.future_schema_migrations (version) VALUES (4);`); err != nil {
 		t.Fatalf("seed future schema: %v", err)
 	}
 	for name, mode := range map[string]MigrationMode{"apply": MigrationApply, "validate": MigrationValidate} {
@@ -294,8 +409,8 @@ func TestMigrationIsIdempotentAndValidatesACurrentSchema(t *testing.T) {
 	if err := admin.QueryRow(ctx, "SELECT count(*) FROM reopen.again_schema_migrations").Scan(&versions); err != nil {
 		t.Fatalf("count versions: %v", err)
 	}
-	if versions != 2 {
-		t.Fatalf("version rows after two applies = %d, want 2", versions)
+	if versions != 3 {
+		t.Fatalf("version rows after two applies = %d, want 3", versions)
 	}
 
 	options.Migrations = MigrationValidate

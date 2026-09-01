@@ -57,7 +57,7 @@ func Open(ctx context.Context, options Options) (*Store, error) {
 		Ledger:       ledger.New(pool, resolved.schema, resolved.tablePrefix, resolved.statementTimeout, resolved.lockTimeout),
 		Leaser:       leaseStore,
 		KV:           kv.New(pool, resolved.schema, resolved.tablePrefix),
-		OrderedIndex: orderedindex.New(pool, resolved.schema, resolved.tablePrefix),
+		OrderedIndex: orderedindex.New(pool, resolved.schema, resolved.tablePrefix, resolved.statementTimeout, resolved.lockTimeout),
 		closePool: func() {
 			leaseStore.Close()
 			pool.Close()

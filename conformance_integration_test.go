@@ -4,6 +4,7 @@ package pgstore
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -54,6 +55,23 @@ func TestLeaserConformance(t *testing.T) {
 	storetest.TestLeaser(t, func(t *testing.T) storage.Leaser {
 		return newConformanceStore(t).Leaser
 	})
+}
+
+type postgresOrderedCursorProbe struct{}
+
+func (postgresOrderedCursorProbe) MalformedCursor(_ *testing.T, _ storage.OrderedCursorKind) string {
+	return "not-base64!!!"
+}
+
+func (postgresOrderedCursorProbe) UnknownVersionCursor(_ *testing.T, kind storage.OrderedCursorKind) string {
+	raw := fmt.Sprintf(`{"v":2,"k":%q}`, kind)
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+func TestOrderedIndexConformance(t *testing.T) {
+	storetest.TestOrderedIndex(t, func(t *testing.T) storage.OrderedIndex {
+		return newConformanceStore(t).OrderedIndex
+	}, postgresOrderedCursorProbe{})
 }
 
 func TestLeaserLifecycleConformance(t *testing.T) {
@@ -113,21 +131,4 @@ func TestLeaserLifecycleConformance(t *testing.T) {
 			},
 		}
 	})
-}
-
-type orderedCursorProbe struct{}
-
-func (orderedCursorProbe) MalformedCursor(*testing.T, storage.OrderedCursorKind) string {
-	return "pgstore-malformed"
-}
-
-func (orderedCursorProbe) UnknownVersionCursor(*testing.T, storage.OrderedCursorKind) string {
-	return "pgo999:unknown-version"
-}
-
-func TestOrderedIndexConformance(t *testing.T) {
-	t.Skip("P1.4 implements PostgreSQL ordered index")
-	storetest.TestOrderedIndex(t, func(t *testing.T) storage.OrderedIndex {
-		return newConformanceStore(t).OrderedIndex
-	}, orderedCursorProbe{})
 }

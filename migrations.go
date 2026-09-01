@@ -16,7 +16,7 @@ import (
 	pginternal "github.com/looprig/pgstore/internal/postgres"
 )
 
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
@@ -78,11 +78,6 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, schema, prefix string, mod
 		if parseErr != nil || n <= version {
 			continue
 		}
-		// COVERAGE NOTE: with exactly one embedded migration this branch cannot
-		// be reached by any input — n is 1 and version is 0 whenever the loop
-		// body runs — so no test kills a mutation that disables it, and none
-		// pretends to. It becomes reachable, and must be covered, when P1.3 or
-		// P1.4 adds the second migration file.
 		if n != version+1 {
 			return errors.New("pgstore: embedded migrations are not monotonic")
 		}
@@ -91,11 +86,16 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, schema, prefix string, mod
 			return errors.New("pgstore: embedded migration unavailable")
 		}
 		replacements := map[string]string{
-			"{{schema}}":         pginternal.QuoteIdentifier(schema),
-			"{{ledger_scopes}}":  pginternal.QuoteIdentifier(prefix + "ledger_scopes"),
-			"{{ledger_records}}": pginternal.QuoteIdentifier(prefix + "ledger_records"),
-			"{{kv}}":             pginternal.QuoteIdentifier(prefix + "kv"),
-			"{{leases}}":         pginternal.QuoteIdentifier(prefix + "leases"),
+			"{{schema}}":            pginternal.QuoteIdentifier(schema),
+			"{{ledger_scopes}}":     pginternal.QuoteIdentifier(prefix + "ledger_scopes"),
+			"{{ledger_records}}":    pginternal.QuoteIdentifier(prefix + "ledger_records"),
+			"{{kv}}":                pginternal.QuoteIdentifier(prefix + "kv"),
+			"{{leases}}":            pginternal.QuoteIdentifier(prefix + "leases"),
+			"{{ordered_scopes}}":    pginternal.QuoteIdentifier(prefix + "ordered_scopes"),
+			"{{ordered_records}}":   pginternal.QuoteIdentifier(prefix + "ordered_records"),
+			"{{ordered_order_idx}}": pginternal.QuoteIdentifier(prefix + "ordered_order_idx"),
+			"{{ordered_rank_idx}}":  pginternal.QuoteIdentifier(prefix + "ordered_rank_idx"),
+			"{{ordered_due_idx}}":   pginternal.QuoteIdentifier(prefix + "ordered_due_idx"),
 		}
 		statement := string(sqlBytes)
 		for token, identifier := range replacements {
