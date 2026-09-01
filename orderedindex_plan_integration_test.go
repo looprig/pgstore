@@ -16,6 +16,44 @@ import (
 	pginternal "github.com/looprig/pgstore/internal/postgres"
 )
 
+type orderedPlanFamily string
+
+const (
+	orderedPlanOrder  orderedPlanFamily = "order"
+	orderedPlanRanked orderedPlanFamily = "ranked"
+	orderedPlanDue    orderedPlanFamily = "due"
+)
+
+type orderedPlanPage string
+
+const (
+	orderedPlanFirst  orderedPlanPage = "first"
+	orderedPlanMiddle orderedPlanPage = "middle"
+)
+
+type orderedPlanCase struct {
+	name      string
+	family    orderedPlanFamily
+	page      orderedPlanPage
+	indexName string
+	statement orderedquery.Statement
+	wantArgs  []any
+}
+
+func orderedPlanCases(table, prefix string) []orderedPlanCase {
+	return []orderedPlanCase{
+		{name: "order first", family: orderedPlanOrder, page: orderedPlanFirst, indexName: prefix + "ordered_order_idx", statement: orderedquery.Ordered(table, "sessions", "scope-1", 0, 25), wantArgs: []any{"sessions", "scope-1", "0", 25}},
+		{name: "order middle", family: orderedPlanOrder, page: orderedPlanMiddle, indexName: prefix + "ordered_order_idx", statement: orderedquery.Ordered(table, "sessions", "scope-1", 500, 25), wantArgs: []any{"sessions", "scope-1", "500", 25}},
+		{name: "rank first", family: orderedPlanRanked, page: orderedPlanFirst, indexName: prefix + "ordered_rank_idx", statement: orderedquery.Ranked(table, "sessions", "workers", nil, 24), wantArgs: []any{"sessions", "workers", 25}},
+		{name: "rank middle", family: orderedPlanRanked, page: orderedPlanMiddle, indexName: prefix + "ordered_rank_idx", statement: orderedquery.Ranked(table, "sessions", "workers", &orderedquery.RankedPosition{Rank: 50, StableKey: []byte("key-000500"), OrderingScope: "scope-5"}, 24), wantArgs: []any{"sessions", "workers", int64(50), []byte("key-000500"), "scope-5", 25}},
+		// Storage v0.6.0 ListDue has no scope argument. Both pages must use the
+		// namespace+state+due tuple index, proving the runbook shorthand was not
+		// accidentally implemented as an API-incompatible scope filter.
+		{name: "due first no invented scope", family: orderedPlanDue, page: orderedPlanFirst, indexName: prefix + "ordered_due_idx", statement: orderedquery.Due(table, "sessions", 999, nil, 24), wantArgs: []any{"sessions", int64(999), 25}},
+		{name: "due middle no invented scope", family: orderedPlanDue, page: orderedPlanMiddle, indexName: prefix + "ordered_due_idx", statement: orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{DueAt: 500, StableKey: []byte("key-000500"), OrderingScope: "scope-5"}, 24), wantArgs: []any{"sessions", int64(999), int64(500), []byte("key-000500"), "scope-5", 25}},
+	}
+}
+
 func TestOrderedIndexPlansUseExactKeysetIndexesForFirstAndMiddlePages(t *testing.T) {
 	if os.Getenv("PGSTORE_TEST_DSN") == "" {
 		t.Skip("PGSTORE_TEST_DSN is not set")
@@ -53,23 +91,7 @@ FROM generate_series(1, 10000) AS g`)
 		t.Fatalf("set deterministic planner controls: %v", err)
 	}
 
-	tests := []struct {
-		name      string
-		indexName string
-		statement orderedquery.Statement
-		wantArgs  []any
-	}{
-		{name: "order first", indexName: prefix + "ordered_order_idx", statement: orderedquery.Ordered(table, "sessions", "scope-1", 0, 25), wantArgs: []any{"sessions", "scope-1", "0", 25}},
-		{name: "order middle", indexName: prefix + "ordered_order_idx", statement: orderedquery.Ordered(table, "sessions", "scope-1", 500, 25), wantArgs: []any{"sessions", "scope-1", "500", 25}},
-		{name: "rank first", indexName: prefix + "ordered_rank_idx", statement: orderedquery.Ranked(table, "sessions", "workers", nil, 24), wantArgs: []any{"sessions", "workers", 25}},
-		{name: "rank middle", indexName: prefix + "ordered_rank_idx", statement: orderedquery.Ranked(table, "sessions", "workers", &orderedquery.RankedPosition{Rank: 50, StableKey: []byte("key-000500"), OrderingScope: "scope-5"}, 24), wantArgs: []any{"sessions", "workers", int64(50), []byte("key-000500"), "scope-5", 25}},
-		// Storage v0.6.0 ListDue has no scope argument. Both pages must use the
-		// namespace+state+due tuple index, proving the runbook shorthand was not
-		// accidentally implemented as an API-incompatible scope filter.
-		{name: "due first no invented scope", indexName: prefix + "ordered_due_idx", statement: orderedquery.Due(table, "sessions", 999, nil, 24), wantArgs: []any{"sessions", int64(999), 25}},
-		{name: "due middle no invented scope", indexName: prefix + "ordered_due_idx", statement: orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{DueAt: 500, StableKey: []byte("key-000500"), OrderingScope: "scope-5"}, 24), wantArgs: []any{"sessions", int64(999), int64(500), []byte("key-000500"), "scope-5", 25}},
-	}
-	for _, test := range tests {
+	for _, test := range orderedPlanCases(table, prefix) {
 		t.Run(test.name, func(t *testing.T) {
 			if !reflect.DeepEqual(test.statement.Args, test.wantArgs) {
 				t.Fatalf("production query arguments = %#v, want exact values/types/order %#v", test.statement.Args, test.wantArgs)

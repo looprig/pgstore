@@ -70,10 +70,14 @@ in-memory global sort.
 The three page statements and their ordered bound arguments are constructed by one
 internal package used by both production and the tagged EXPLAIN gate. The plan gate
 therefore executes the exact first/middle-page SQL rather than a hand-copied facsimile.
-Its unit guard parses both call sites with Go's AST: every production listing must pass
-one directly built statement's SQL and variadic arguments to `Query`, and the plan table
-must contain exactly the six direct first/middle builder calls. This structural check is
-insensitive to harmless formatting while copied SQL and unused or shadowed builder calls
+Its unit guard parses both call sites with Go's AST: each unique `*Store` listing method
+must pass its one directly built family statement's SQL and variadic arguments to its
+one receiver-bound `Query`. The tagged integration test ranges directly over one helper
+that owns exactly six family/page-labelled first/middle builder calls, and its sole
+`QueryRow` must consume that range value on the transaction it opened. Family/page
+metadata is checked against the cursor argument, including typed nil. This structural
+check is insensitive to harmless formatting while copied SQL, unused/dead builders,
+decoy queries, receiver shadowing, duplicate methods, and an alternate live case table
 cannot satisfy statement ownership.
 ListOrdered qualifies the physical numeric `order_id` in its `ORDER BY`: the selected
 value is cast to text for lossless unsigned decoding, and an unqualified name would

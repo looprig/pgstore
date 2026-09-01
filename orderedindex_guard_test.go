@@ -59,12 +59,12 @@ func TestOrderedIndexPlanGateUsesProductionStatements(t *testing.T) {
 
 func TestPlanGateStatementOwnershipRejectsCopiesAndUnusedBuilders(t *testing.T) {
 	validEntries := []string{
-		`{statement: orderedquery.Ordered(table, "sessions", "scope", 0, 25)}`,
-		`{statement: orderedquery.Ordered(table, "sessions", "scope", 500, 25)}`,
-		`{statement: orderedquery.Ranked(table, "sessions", "rank", nil, 24)}`,
-		`{statement: orderedquery.Ranked(table, "sessions", "rank", &orderedquery.RankedPosition{}, 24)}`,
-		`{statement: orderedquery.Due(table, "sessions", 999, nil, 24)}`,
-		`{statement: orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{}, 24)}`,
+		`{family: orderedPlanOrder, page: orderedPlanFirst, statement: orderedquery.Ordered(table, "sessions", "scope", 0, 25)}`,
+		`{family: orderedPlanOrder, page: orderedPlanMiddle, statement: orderedquery.Ordered(table, "sessions", "scope", 500, 25)}`,
+		`{family: orderedPlanRanked, page: orderedPlanFirst, statement: orderedquery.Ranked(table, "sessions", "rank", nil, 24)}`,
+		`{family: orderedPlanRanked, page: orderedPlanMiddle, statement: orderedquery.Ranked(table, "sessions", "rank", &orderedquery.RankedPosition{}, 24)}`,
+		`{family: orderedPlanDue, page: orderedPlanFirst, statement: orderedquery.Due(table, "sessions", 999, nil, 24)}`,
+		`{family: orderedPlanDue, page: orderedPlanMiddle, statement: orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{}, 24)}`,
 	}
 	copied := `orderedquery.Statement{SQL: "SELECT namespace, ordering_scope, stable_key, ranking_scope, revision::text, order_id::text, value, value_is_nil, ranked, rank_value, due_state, due_at, deleted FROM records WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted ORDER BY rank_value DESC, stable_key DESC, ordering_scope DESC LIMIT $3"}`
 	formattedCopy := "orderedquery.Statement{SQL: `SELECT namespace, ordering_scope, stable_key\nFROM records\nWHERE namespace = $1\n  AND due_state = 1\n  AND NOT deleted\nORDER BY due_at ASC, stable_key ASC, ordering_scope ASC\nLIMIT $3`}"
@@ -74,10 +74,10 @@ func TestPlanGateStatementOwnershipRejectsCopiesAndUnusedBuilders(t *testing.T) 
 		entries []string
 		extra   string
 	}{
-		{name: "exact copied ranked SQL", entries: replaceEntry(validEntries, 2, `{statement: `+copied+`}`)},
-		{name: "format-varied copied due SQL", entries: replaceEntry(validEntries, 4, `{statement: `+formattedCopy+`}`)},
-		{name: "copied SQL plus unused builder", entries: replaceEntry(validEntries, 0, `{statement: orderedquery.Statement{SQL: "SELECT " + orderedquery.RecordColumns + " FROM " + table + " WHERE namespace = $1 AND ordering_scope = $2 AND order_id > $3::numeric ORDER BY " + table + ".order_id ASC, stable_key ASC LIMIT $4"}}`), extra: `_ = orderedquery.Ordered(table, "sessions", "scope", 0, 25)`},
-		{name: "duplicate first ranked page", entries: replaceEntry(validEntries, 3, `{statement: orderedquery.Ranked(table, "sessions", "rank", nil, 24)}`)},
+		{name: "exact copied ranked SQL", entries: replaceEntry(validEntries, 2, `{family: orderedPlanRanked, page: orderedPlanFirst, statement: `+copied+`}`)},
+		{name: "format-varied copied due SQL", entries: replaceEntry(validEntries, 4, `{family: orderedPlanDue, page: orderedPlanFirst, statement: `+formattedCopy+`}`)},
+		{name: "copied SQL plus unused builder", entries: replaceEntry(validEntries, 0, `{family: orderedPlanOrder, page: orderedPlanFirst, statement: orderedquery.Statement{SQL: "SELECT " + orderedquery.RecordColumns + " FROM " + table + " WHERE namespace = $1 AND ordering_scope = $2 AND order_id > $3::numeric ORDER BY " + table + ".order_id ASC, stable_key ASC LIMIT $4"}}`), extra: `_ = orderedquery.Ordered(table, "sessions", "scope", 0, 25)`},
+		{name: "duplicate first ranked page", entries: replaceEntry(validEntries, 3, `{family: orderedPlanRanked, page: orderedPlanMiddle, statement: orderedquery.Ranked(table, "sessions", "rank", nil, 24)}`)},
 		{name: "no plan table", entries: nil},
 	}
 	for _, test := range tests {
@@ -91,26 +91,55 @@ func TestPlanGateStatementOwnershipRejectsCopiesAndUnusedBuilders(t *testing.T) 
 
 func TestPlanGateStatementOwnershipAllowsLegalFormatting(t *testing.T) {
 	entries := []string{
-		`{statement: (orderedquery.Ordered(
+		`{family: (orderedPlanOrder), page: orderedPlanFirst, statement: (orderedquery.Ordered(
 			table, "sessions", "scope", (0), 25,
 		))}`,
-		`{statement: ((orderedquery.Ordered(table, "sessions", "scope", 500, 25)))}`,
-		`{statement: orderedquery.Ranked(table, "sessions", "rank", (nil), 24)}`,
-		`{statement: (orderedquery.Ranked(table, "sessions", "rank", &orderedquery.RankedPosition{}, 24))}`,
-		`{statement: orderedquery.Due(table, "sessions", 999, nil, 24)}`,
-		`{statement: orderedquery.Due(
+		`{family: orderedPlanOrder, page: (orderedPlanMiddle), statement: ((orderedquery.Ordered(table, "sessions", "scope", 500, 25)))}`,
+		`{family: orderedPlanRanked, page: orderedPlanFirst, statement: orderedquery.Ranked(table, "sessions", "rank", ((*orderedquery.RankedPosition)(nil)), 24)}`,
+		`{family: orderedPlanRanked, page: orderedPlanMiddle, statement: (orderedquery.Ranked(table, "sessions", "rank", &orderedquery.RankedPosition{}, 24))}`,
+		`{family: orderedPlanDue, page: orderedPlanFirst, statement: orderedquery.Due(table, "sessions", 999, (nil), 24)}`,
+		`{family: orderedPlanDue, page: orderedPlanMiddle, statement: orderedquery.Due(
 			table, "sessions", 999,
 			(&orderedquery.DuePosition{}), 24,
 		)}`,
 	}
-	if err := validatePlanGateStatementOwnership([]byte(planOwnershipFixture(entries, ""))); err != nil {
+	legalLoop := `for _, test := range (orderedPlanCases(
+		table, prefix,
+	)) {
+		(tx).QueryRow(ctx, ("EXPLAIN "+((test.statement.SQL))), ((test.statement.Args))...)
+	}`
+	if err := validatePlanGateStatementOwnership([]byte(planOwnershipFixtureWithLoop(entries, "", legalLoop))); err != nil {
 		t.Fatalf("ownership validation rejected legal formatting: %v", err)
 	}
 }
 
+func TestPlanGateOwnershipBindsTheActuallyExplainedCaseSource(t *testing.T) {
+	deadEntries := []string{
+		`{family: orderedPlanOrder, page: orderedPlanFirst, statement: orderedquery.Ordered(table, "sessions", "scope", 0, 25)}`,
+		`{family: orderedPlanOrder, page: orderedPlanMiddle, statement: orderedquery.Ordered(table, "sessions", "scope", 500, 25)}`,
+		`{family: orderedPlanRanked, page: orderedPlanFirst, statement: orderedquery.Ranked(table, "sessions", "rank", nil, 24)}`,
+		`{family: orderedPlanRanked, page: orderedPlanMiddle, statement: orderedquery.Ranked(table, "sessions", "rank", &orderedquery.RankedPosition{}, 24)}`,
+		`{family: orderedPlanDue, page: orderedPlanFirst, statement: orderedquery.Due(table, "sessions", 999, nil, 24)}`,
+		`{family: orderedPlanDue, page: orderedPlanMiddle, statement: orderedquery.Due(table, "sessions", 999, &orderedquery.DuePosition{}, 24)}`,
+	}
+	t.Run("dead helper and live copied table", func(t *testing.T) {
+		deadTableLiveCopy := planOwnershipFixtureWithLoop(deadEntries, "", `live := []orderedPlanCase{{statement: orderedquery.Statement{SQL: "SELECT copied"}}}
+	for _, test := range live { tx.QueryRow(ctx, "EXPLAIN "+test.statement.SQL, test.statement.Args...) }`)
+		if err := validatePlanGateStatementOwnership([]byte(deadTableLiveCopy)); err == nil {
+			t.Fatal("ownership validation accepted a dead valid helper while the live EXPLAIN loop consumed copied SQL")
+		}
+	})
+	t.Run("typed nil marked middle", func(t *testing.T) {
+		typedNilMiddle := replaceEntry(deadEntries, 3, `{family: orderedPlanRanked, page: orderedPlanMiddle, statement: orderedquery.Ranked(table, "sessions", "rank", (*orderedquery.RankedPosition)(nil), 24)}`)
+		if err := validatePlanGateStatementOwnership([]byte(planOwnershipFixture(typedNilMiddle, ""))); err == nil {
+			t.Fatal("ownership validation classified a typed nil ranked cursor as a middle page")
+		}
+	})
+}
+
 func TestProductionStatementOwnershipRequiresConsumedDirectBuilders(t *testing.T) {
 	valid := productionOwnershipFixture(
-		`q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`,
+		`q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := ((s.pool.Query))(ctx, (q.SQL), (q.Args)...)`,
 		`rankStatement := orderedquery.Ranked(table, namespace, scope, position, limit); rows, _ := s.pool.Query(ctx, rankStatement.SQL, rankStatement.Args...)`,
 		`dueStatement := (orderedquery.Due(table, namespace, bound, position, limit)); rows, _ := s.pool.Query(ctx, dueStatement.SQL, dueStatement.Args...)`,
 	)
@@ -141,6 +170,39 @@ func TestProductionStatementOwnershipRequiresConsumedDirectBuilders(t *testing.T
 	}
 }
 
+func TestProductionOwnershipRejectsDecoyQueriesAndReceiverConfusion(t *testing.T) {
+	ordered := `q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`
+	due := `q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`
+	tests := []struct {
+		name   string
+		ranked string
+	}{
+		{name: "dead second receiver query", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); if false { s.pool.Query(ctx, "SELECT decoy") }; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
+		{name: "second query on another receiver", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); if false { other.pool.Query(ctx, "SELECT decoy") }; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...)`},
+		{name: "copied live query with dead valid query", ranked: `valid := orderedquery.Ranked(table, namespace, scope, position, limit); if false { s.pool.Query(ctx, valid.SQL, valid.Args...) }; copied := orderedquery.Statement{SQL: "SELECT copied"}; rows, _ := s.pool.Query(ctx, copied.SQL, copied.Args...)`},
+		{name: "receiver shadow", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); { s := other; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); _ = rows }`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateProductionStatementOwnership([]byte(productionOwnershipFixture(ordered, test.ranked, due))); err == nil {
+				t.Fatal("production ownership accepted a decoy, copied live query, or receiver shadow")
+			}
+		})
+	}
+
+	// Duplicate method declarations are parser-valid, but intentionally invalid to
+	// the Go type checker. The structural guard must diagnose the duplicate rather
+	// than silently letting a bare-name map overwrite one declaration.
+	duplicate := productionOwnershipFixture(ordered, `copied := orderedquery.Statement{SQL: "SELECT copied"}; rows, _ := s.pool.Query(ctx, copied.SQL, copied.Args...)`, due) +
+		`func (s *Store) ListRanked() { q := orderedquery.Ranked(table, namespace, scope, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...) }`
+	if _, err := parser.ParseFile(token.NewFileSet(), "duplicate.go", duplicate, 0); err != nil {
+		t.Fatalf("duplicate declaration fixture is not parser-valid: %v", err)
+	}
+	if err := validateProductionStatementOwnership([]byte(duplicate)); err == nil {
+		t.Fatal("production ownership accepted duplicate ListRanked method declarations")
+	}
+}
+
 func replaceEntry(entries []string, index int, replacement string) []string {
 	result := append([]string(nil), entries...)
 	result[index] = replacement
@@ -148,14 +210,30 @@ func replaceEntry(entries []string, index int, replacement string) []string {
 }
 
 func planOwnershipFixture(entries []string, extra string) string {
+	return planOwnershipFixtureWithLoop(entries, extra, `for _, test := range orderedPlanCases(table, prefix) {
+		tx.QueryRow(ctx, "EXPLAIN "+test.statement.SQL, test.statement.Args...)
+	}`)
+}
+
+func planOwnershipFixtureWithLoop(entries []string, extra, loop string) string {
 	return fmt.Sprintf(`package fixture
-func planGate() {
-	table := "records"
+type orderedPlanFamily string
+const ( orderedPlanOrder orderedPlanFamily = "order"; orderedPlanRanked orderedPlanFamily = "ranked"; orderedPlanDue orderedPlanFamily = "due" )
+type orderedPlanPage string
+const ( orderedPlanFirst orderedPlanPage = "first"; orderedPlanMiddle orderedPlanPage = "middle" )
+type orderedPlanCase struct { family orderedPlanFamily; page orderedPlanPage; statement orderedquery.Statement }
+func orderedPlanCases(table, prefix string) []orderedPlanCase {
 	%s
-	_ = []struct { statement orderedquery.Statement }{
+	return []orderedPlanCase{
 		%s,
 	}
-}`, extra, strings.Join(entries, ",\n"))
+}
+func TestOrderedIndexPlansUseExactKeysetIndexesForFirstAndMiddlePages() {
+	table := "records"
+	prefix := "p"
+	tx, _ := admin.BeginTx(ctx)
+	%s
+}`, extra, strings.Join(entries, ",\n"), loop)
 }
 
 func productionOwnershipFixture(ordered, ranked, due string) string {
@@ -176,26 +254,31 @@ func validatePlanGateStatementOwnership(source []byte) error {
 	if err != nil {
 		return fmt.Errorf("parse plan gate: %w", err)
 	}
-	var tables []*ast.CompositeLit
-	ast.Inspect(file, func(node ast.Node) bool {
-		literal, ok := node.(*ast.CompositeLit)
-		if ok && isPlanCaseTable(literal.Type) {
-			tables = append(tables, literal)
-		}
-		return true
-	})
-	if len(tables) != 1 {
-		return fmt.Errorf("found %d plan-case tables, want exactly 1", len(tables))
+	helpers := freeFunctionsNamed(file, "orderedPlanCases")
+	if len(helpers) != 1 {
+		return fmt.Errorf("found %d orderedPlanCases helpers, want exactly 1", len(helpers))
 	}
-	if len(tables[0].Elts) != 6 {
-		return fmt.Errorf("plan-case table has %d cases, want exactly 6", len(tables[0].Elts))
+	table, err := returnedPlanCaseTable(helpers[0])
+	if err != nil {
+		return err
+	}
+	if len(table.Elts) != 6 {
+		return fmt.Errorf("orderedPlanCases has %d cases, want exactly 6", len(table.Elts))
 	}
 
 	pages := map[string]pageKinds{"Ordered": {}, "Ranked": {}, "Due": {}}
-	for index, element := range tables[0].Elts {
+	for index, element := range table.Elts {
 		caseLiteral, ok := unparen(element).(*ast.CompositeLit)
 		if !ok {
 			return fmt.Errorf("plan case %d is not a keyed composite literal", index+1)
+		}
+		familyMetadata, err := keyedIdentifier(caseLiteral, "family")
+		if err != nil {
+			return fmt.Errorf("plan case %d: %w", index+1, err)
+		}
+		pageMetadata, err := keyedIdentifier(caseLiteral, "page")
+		if err != nil {
+			return fmt.Errorf("plan case %d: %w", index+1, err)
 		}
 		statement, err := keyedField(caseLiteral, "statement")
 		if err != nil {
@@ -208,24 +291,41 @@ func validatePlanGateStatementOwnership(source []byte) error {
 		if len(call.Args) != 5 {
 			return fmt.Errorf("plan case %d %s call has %d arguments, want 5", index+1, family, len(call.Args))
 		}
+		wantFamilyMetadata := map[string]string{
+			"Ordered": "orderedPlanOrder",
+			"Ranked":  "orderedPlanRanked",
+			"Due":     "orderedPlanDue",
+		}[family]
+		if wantFamilyMetadata == "" || familyMetadata != wantFamilyMetadata {
+			return fmt.Errorf("plan case %d family metadata %s disagrees with orderedquery.%s", index+1, familyMetadata, family)
+		}
 		kind := pages[family]
+		actualPage := ""
 		switch family {
 		case "Ordered":
 			if isZeroInteger(call.Args[3]) {
-				kind.first++
+				actualPage = "orderedPlanFirst"
 			} else if isNonzeroInteger(call.Args[3]) {
-				kind.middle++
+				actualPage = "orderedPlanMiddle"
 			} else {
 				return fmt.Errorf("plan case %d Ordered cursor is not a literal first/middle position", index+1)
 			}
 		case "Ranked", "Due":
-			if isNil(call.Args[3]) {
-				kind.first++
+			if isNilCursor(call.Args[3], family) {
+				actualPage = "orderedPlanFirst"
 			} else {
-				kind.middle++
+				actualPage = "orderedPlanMiddle"
 			}
 		default:
 			return fmt.Errorf("plan case %d uses unexpected orderedquery.%s builder", index+1, family)
+		}
+		if pageMetadata != actualPage {
+			return fmt.Errorf("plan case %d page metadata %s disagrees with its %s cursor", index+1, pageMetadata, actualPage)
+		}
+		if actualPage == "orderedPlanFirst" {
+			kind.first++
+		} else {
+			kind.middle++
 		}
 		pages[family] = kind
 	}
@@ -234,7 +334,175 @@ func validatePlanGateStatementOwnership(source []byte) error {
 			return fmt.Errorf("orderedquery.%s plan coverage = %d first/%d middle, want 1/1", family, got.first, got.middle)
 		}
 	}
+	return validatePlanIntegrationLoop(file)
+}
+
+func freeFunctionsNamed(file *ast.File, name string) []*ast.FuncDecl {
+	var functions []*ast.FuncDecl
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Recv == nil && function.Name.Name == name && function.Body != nil {
+			functions = append(functions, function)
+		}
+	}
+	return functions
+}
+
+func returnedPlanCaseTable(function *ast.FuncDecl) (*ast.CompositeLit, error) {
+	var returns []*ast.ReturnStmt
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		if statement, ok := node.(*ast.ReturnStmt); ok {
+			returns = append(returns, statement)
+		}
+		return true
+	})
+	if len(returns) != 1 || len(returns[0].Results) != 1 {
+		return nil, fmt.Errorf("orderedPlanCases must have exactly one single-value return")
+	}
+	literal, ok := unparen(returns[0].Results[0]).(*ast.CompositeLit)
+	if !ok || !isSliceOfNamed(literal.Type, "orderedPlanCase") {
+		return nil, fmt.Errorf("orderedPlanCases must directly return []orderedPlanCase")
+	}
+	return literal, nil
+}
+
+func isSliceOfNamed(expression ast.Expr, name string) bool {
+	array, ok := unparen(expression).(*ast.ArrayType)
+	if !ok || array.Len != nil {
+		return false
+	}
+	identifier, ok := unparen(array.Elt).(*ast.Ident)
+	return ok && identifier.Name == name
+}
+
+func keyedIdentifier(literal *ast.CompositeLit, field string) (string, error) {
+	expression, err := keyedField(literal, field)
+	if err != nil {
+		return "", err
+	}
+	identifier, ok := unparen(expression).(*ast.Ident)
+	if !ok {
+		return "", fmt.Errorf("%s is not a plan metadata identifier", field)
+	}
+	return identifier.Name, nil
+}
+
+func validatePlanIntegrationLoop(file *ast.File) error {
+	tests := freeFunctionsNamed(file, "TestOrderedIndexPlansUseExactKeysetIndexesForFirstAndMiddlePages")
+	if len(tests) != 1 {
+		return fmt.Errorf("found %d exact ordered-plan integration tests, want exactly 1", len(tests))
+	}
+	test := tests[0]
+	var transactions []*ast.Ident
+	ast.Inspect(test.Body, func(node ast.Node) bool {
+		assignment, ok := node.(*ast.AssignStmt)
+		if !ok || len(assignment.Lhs) == 0 || len(assignment.Rhs) == 0 || !isSelectorCall(assignment.Rhs[0], "BeginTx") {
+			return true
+		}
+		if identifier, ok := assignment.Lhs[0].(*ast.Ident); ok {
+			transactions = append(transactions, identifier)
+		}
+		return true
+	})
+	if len(transactions) != 1 {
+		return fmt.Errorf("plan integration test has %d BeginTx result bindings, want exactly 1", len(transactions))
+	}
+	var ranges []*ast.RangeStmt
+	ast.Inspect(test.Body, func(node ast.Node) bool {
+		rangeStatement, ok := node.(*ast.RangeStmt)
+		if !ok || !isIdentifierCall(rangeStatement.X, "orderedPlanCases") {
+			return true
+		}
+		ranges = append(ranges, rangeStatement)
+		return true
+	})
+	if len(ranges) != 1 {
+		return fmt.Errorf("plan integration test has %d direct orderedPlanCases ranges, want exactly 1", len(ranges))
+	}
+	rangeValue, ok := ranges[0].Value.(*ast.Ident)
+	if !ok || rangeValue.Name == "_" {
+		return fmt.Errorf("orderedPlanCases range must bind its case value")
+	}
+	var queryRows []*ast.CallExpr
+	ast.Inspect(test.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := unparen(call.Fun).(*ast.SelectorExpr)
+		if ok && selector.Sel.Name == "QueryRow" {
+			queryRows = append(queryRows, call)
+		}
+		return true
+	})
+	if len(queryRows) != 1 {
+		return fmt.Errorf("plan integration test has %d QueryRow calls, want exactly 1", len(queryRows))
+	}
+	query := queryRows[0]
+	if !nodeContains(ranges[0].Body, query) {
+		return fmt.Errorf("plan integration QueryRow is not inside the orderedPlanCases range")
+	}
+	selector := unparen(query.Fun).(*ast.SelectorExpr)
+	queryReceiver, ok := unparen(selector.X).(*ast.Ident)
+	if !ok || !sameObject(queryReceiver, transactions[0]) {
+		return fmt.Errorf("plan integration QueryRow is not called on its BeginTx result")
+	}
+	if len(query.Args) != 3 || query.Ellipsis == token.NoPos || !isExplainStatement(query.Args[1], rangeValue) || !isNestedSelector(query.Args[2], rangeValue, "statement", "Args") {
+		return fmt.Errorf("plan integration QueryRow must explain the ranged case statement SQL with its variadic Args")
+	}
 	return nil
+}
+
+func isSelectorCall(expression ast.Expr, method string) bool {
+	call, ok := unparen(expression).(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	selector, ok := unparen(call.Fun).(*ast.SelectorExpr)
+	return ok && selector.Sel.Name == method
+}
+
+func isIdentifierCall(expression ast.Expr, name string) bool {
+	call, ok := unparen(expression).(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	identifier, ok := unparen(call.Fun).(*ast.Ident)
+	return ok && identifier.Name == name
+}
+
+func nodeContains(root ast.Node, target ast.Node) bool {
+	found := false
+	ast.Inspect(root, func(node ast.Node) bool {
+		if node == target {
+			found = true
+			return false
+		}
+		return !found
+	})
+	return found
+}
+
+func isExplainStatement(expression ast.Expr, value *ast.Ident) bool {
+	binary, ok := unparen(expression).(*ast.BinaryExpr)
+	if !ok || binary.Op != token.ADD {
+		return false
+	}
+	literal, ok := unparen(binary.X).(*ast.BasicLit)
+	return ok && literal.Kind == token.STRING && strings.Contains(literal.Value, "EXPLAIN") && isNestedSelector(binary.Y, value, "statement", "SQL")
+}
+
+func isNestedSelector(expression ast.Expr, root *ast.Ident, first, second string) bool {
+	outer, ok := unparen(expression).(*ast.SelectorExpr)
+	if !ok || outer.Sel.Name != second {
+		return false
+	}
+	inner, ok := unparen(outer.X).(*ast.SelectorExpr)
+	if !ok || inner.Sel.Name != first {
+		return false
+	}
+	identifier, ok := unparen(inner.X).(*ast.Ident)
+	return ok && sameObject(identifier, root)
 }
 
 func validateProductionStatementOwnership(source []byte) error {
@@ -242,19 +510,13 @@ func validateProductionStatementOwnership(source []byte) error {
 	if err != nil {
 		return fmt.Errorf("parse OrderedIndex production: %w", err)
 	}
-	functions := make(map[string]*ast.FuncDecl)
-	for _, declaration := range file.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if ok {
-			functions[function.Name.Name] = function
-		}
-	}
 	for _, family := range []string{"Ordered", "Ranked", "Due"} {
-		function := functions["List"+family]
-		if function == nil || function.Body == nil {
-			return fmt.Errorf("missing List%s implementation", family)
+		methods := storeMethodsNamed(file, "List"+family)
+		if len(methods) != 1 {
+			return fmt.Errorf("found %d *Store.List%s methods, want exactly 1", len(methods), family)
 		}
-		owned := false
+		function, receiver := methods[0].function, methods[0].receiver
+		var statements []*ast.Ident
 		ast.Inspect(function.Body, func(node ast.Node) bool {
 			assignment, ok := node.(*ast.AssignStmt)
 			if !ok || len(assignment.Lhs) != len(assignment.Rhs) {
@@ -263,42 +525,97 @@ func validateProductionStatementOwnership(source []byte) error {
 			for index, right := range assignment.Rhs {
 				builder, _, direct := orderedQueryCall(right)
 				name, named := assignment.Lhs[index].(*ast.Ident)
-				if direct && builder == family && named && queryConsumesStatement(function.Body, name) {
-					owned = true
+				if direct && builder == family && named {
+					statements = append(statements, name)
 				}
 			}
 			return true
 		})
-		if !owned {
-			return fmt.Errorf("List%s does not pass a directly built orderedquery.%s statement and args to Query", family, family)
+		if len(statements) != 1 {
+			return fmt.Errorf("List%s has %d direct orderedquery.%s statement assignments, want exactly 1", family, len(statements), family)
+		}
+		queries := methodCallsNamed(function.Body, "Query")
+		if len(queries) != 1 {
+			return fmt.Errorf("List%s has %d Query calls, want exactly 1", family, len(queries))
+		}
+		query := queries[0]
+		if !isReceiverPoolCall(query, receiver) || len(query.Args) != 3 || query.Ellipsis == token.NoPos ||
+			!isStatementSelector(query.Args[1], statements[0], "SQL") ||
+			!isStatementSelector(query.Args[2], statements[0], "Args") {
+			return fmt.Errorf("List%s Query is not its receiver-bound pool consuming the one orderedquery.%s statement SQL and variadic Args", family, family)
 		}
 	}
 	return nil
 }
 
-func isPlanCaseTable(expression ast.Expr) bool {
-	array, ok := unparen(expression).(*ast.ArrayType)
-	if !ok {
-		return false
-	}
-	structure, ok := unparen(array.Elt).(*ast.StructType)
-	if !ok {
-		return false
-	}
-	for _, field := range structure.Fields.List {
-		for _, name := range field.Names {
-			if name.Name == "statement" && isOrderedQueryStatement(field.Type) {
-				return true
-			}
-		}
-	}
-	return false
+type storeMethod struct {
+	function *ast.FuncDecl
+	receiver *ast.Ident
 }
 
-func isOrderedQueryStatement(expression ast.Expr) bool {
-	selector, ok := unparen(expression).(*ast.SelectorExpr)
-	packageName, packageOK := selectorPackage(selector)
-	return ok && packageOK && packageName == "orderedquery" && selector.Sel.Name == "Statement"
+func storeMethodsNamed(file *ast.File, name string) []storeMethod {
+	var methods []storeMethod
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != name || function.Body == nil || function.Recv == nil || len(function.Recv.List) != 1 {
+			continue
+		}
+		receiverField := function.Recv.List[0]
+		if len(receiverField.Names) != 1 || !isPointerToNamed(receiverField.Type, "Store") {
+			continue
+		}
+		methods = append(methods, storeMethod{function: function, receiver: receiverField.Names[0]})
+	}
+	return methods
+}
+
+func isPointerToNamed(expression ast.Expr, name string) bool {
+	pointer, ok := unparen(expression).(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	identifier, ok := unparen(pointer.X).(*ast.Ident)
+	return ok && identifier.Name == name
+}
+
+func methodCallsNamed(body *ast.BlockStmt, method string) []*ast.CallExpr {
+	var calls []*ast.CallExpr
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		methodSelector, ok := unparen(call.Fun).(*ast.SelectorExpr)
+		if !ok || methodSelector.Sel.Name != method {
+			return true
+		}
+		calls = append(calls, call)
+		return true
+	})
+	return calls
+}
+
+func isReceiverPoolCall(call *ast.CallExpr, receiver *ast.Ident) bool {
+	methodSelector, ok := unparen(call.Fun).(*ast.SelectorExpr)
+	if !ok || methodSelector.Sel.Name != "Query" {
+		return false
+	}
+	poolSelector, ok := unparen(methodSelector.X).(*ast.SelectorExpr)
+	if !ok || poolSelector.Sel.Name != "pool" {
+		return false
+	}
+	candidate, ok := unparen(poolSelector.X).(*ast.Ident)
+	return ok && sameObject(candidate, receiver)
+}
+
+func sameObject(left, right *ast.Ident) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	if left.Obj != nil || right.Obj != nil {
+		return left.Obj != nil && left.Obj == right.Obj
+	}
+	return left == right
 }
 
 func keyedField(literal *ast.CompositeLit, name string) (ast.Expr, error) {
@@ -347,25 +664,6 @@ func selectorPackage(selector *ast.SelectorExpr) (string, bool) {
 	return identifier.Name, true
 }
 
-func queryConsumesStatement(body *ast.BlockStmt, statement *ast.Ident) bool {
-	consumed := false
-	ast.Inspect(body, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok || len(call.Args) < 3 || call.Ellipsis == token.NoPos {
-			return true
-		}
-		selector, ok := unparen(call.Fun).(*ast.SelectorExpr)
-		if !ok || selector.Sel.Name != "Query" {
-			return true
-		}
-		if isStatementSelector(call.Args[1], statement, "SQL") && isStatementSelector(call.Args[2], statement, "Args") {
-			consumed = true
-		}
-		return true
-	})
-	return consumed
-}
-
 func isStatementSelector(expression ast.Expr, statement *ast.Ident, field string) bool {
 	selector, ok := unparen(expression).(*ast.SelectorExpr)
 	if !ok || selector.Sel.Name != field {
@@ -394,6 +692,23 @@ func unparen(expression ast.Expr) ast.Expr {
 func isNil(expression ast.Expr) bool {
 	identifier, ok := unparen(expression).(*ast.Ident)
 	return ok && identifier.Name == "nil"
+}
+
+func isNilCursor(expression ast.Expr, family string) bool {
+	if isNil(expression) {
+		return true
+	}
+	conversion, ok := unparen(expression).(*ast.CallExpr)
+	if !ok || len(conversion.Args) != 1 || !isNil(conversion.Args[0]) {
+		return false
+	}
+	pointer, ok := unparen(conversion.Fun).(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	selector, ok := unparen(pointer.X).(*ast.SelectorExpr)
+	packageName, packageOK := selectorPackage(selector)
+	return ok && packageOK && packageName == "orderedquery" && selector.Sel.Name == family+"Position"
 }
 
 func isZeroInteger(expression ast.Expr) bool {
