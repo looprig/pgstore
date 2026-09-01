@@ -4,8 +4,8 @@ package pgstore
 
 import (
 	"context"
+	"fmt"
 	"os"
-	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,9 +24,10 @@ func newConformanceStore(t *testing.T) *Store {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	prefix := fmt.Sprintf("test%x_%x_", time.Now().UnixNano(), conformanceStoreID.Add(1))
 	store, err := Open(ctx, Options{
 		DSN:                        dsn,
-		TablePrefix:                "test" + strconv.FormatUint(conformanceStoreID.Add(1), 10) + "_",
+		TablePrefix:                prefix,
 		Migrations:                 MigrationApply,
 		AllowInsecureLocalhostOnly: true,
 	})
@@ -50,6 +51,7 @@ func TestKVConformance(t *testing.T) {
 }
 
 func TestLeaserConformance(t *testing.T) {
+	t.Skip("P1.3 implements PostgreSQL leases")
 	storetest.TestLeaser(t, func(t *testing.T) storage.Leaser {
 		return newConformanceStore(t).Leaser
 	})
@@ -66,6 +68,7 @@ func (orderedCursorProbe) UnknownVersionCursor(*testing.T, storage.OrderedCursor
 }
 
 func TestOrderedIndexConformance(t *testing.T) {
+	t.Skip("P1.4 implements PostgreSQL ordered index")
 	storetest.TestOrderedIndex(t, func(t *testing.T) storage.OrderedIndex {
 		return newConformanceStore(t).OrderedIndex
 	}, orderedCursorProbe{})

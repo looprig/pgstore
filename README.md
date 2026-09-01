@@ -5,11 +5,11 @@ primitives: **Ledger**, **Leaser**, **KV**, and **OrderedIndex**. It intentional
 does not implement `storage.Blobs`; a cloud composition combines these fields
 with the S3-compatible blob provider from `s3store`.
 
-This P1.1 scaffold validates configuration, creates a lazy pgx pool, wires the
-four interfaces, and returns typed `NotImplementedError` values from operations.
-The first schema, migrations, disposable-database fixture, and Ledger/KV
-implementation arrive in P1.2. `Open` therefore does not ping or mutate a
-database yet.
+P1.2 implements migration-safe Ledger and KV over PostgreSQL. `Open` applies,
+validates, or bypasses schema version `0001` according to `Options.Migrations`;
+apply mode serializes owners under an explicit transaction-scoped migration
+lock. Leaser and OrderedIndex remain typed `NotImplementedError` seams for
+P1.3 and P1.4.
 
 ## Configuration
 
@@ -52,5 +52,6 @@ GOWORK=off go test ./...
 ```
 
 The integration-tagged Storage conformance wiring reads `PGSTORE_TEST_DSN` and
-skips when it is absent. P1.2 owns making that suite operational against a
-disposable PostgreSQL database.
+skips when it is absent. Ledger/KV conformance, transaction races, migration
+ownership, cancellation, and ambiguous-commit tests require a disposable
+PostgreSQL database.

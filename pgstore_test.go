@@ -29,7 +29,7 @@ func TestOpenRequiresDeadline(t *testing.T) {
 func TestOperationRejectsNilContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	store, err := Open(ctx, Options{DSN: testDSN})
+	store, err := Open(ctx, Options{DSN: testDSN, Migrations: MigrationDisabled})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestOpenRedactsPoolConstructionError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	store, err := Open(ctx, Options{DSN: testDSN})
+	store, err := Open(ctx, Options{DSN: testDSN, Migrations: MigrationDisabled})
 	if store != nil {
 		t.Fatal("Open returned Store with pool construction error")
 	}
@@ -102,7 +102,7 @@ func TestOpenWiresStructuredPrimitivesWithoutBlobs(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	store, err := Open(ctx, Options{DSN: testDSN})
+	store, err := Open(ctx, Options{DSN: testDSN, Migrations: MigrationDisabled})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestOperationRequiresCallerDeadlineBeforeStubResult(t *testing.T) {
 
 	openCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	store, err := Open(openCtx, Options{DSN: testDSN})
+	store, err := Open(openCtx, Options{DSN: testDSN, Migrations: MigrationDisabled})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -138,26 +138,5 @@ func TestOperationRequiresCallerDeadlineBeforeStubResult(t *testing.T) {
 	}
 	if deadlineErr.Operation != "Ledger.Append" {
 		t.Errorf("DeadlineRequiredError.Operation = %q, want %q", deadlineErr.Operation, "Ledger.Append")
-	}
-}
-
-func TestOperationReturnsHonestNotImplementedError(t *testing.T) {
-	t.Parallel()
-
-	openCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	store, err := Open(openCtx, Options{DSN: testDSN})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(store.Close)
-
-	err = store.Ledger.Append(openCtx, "sessions/unimplemented", 0, nil)
-	var notImplemented *NotImplementedError
-	if !errors.As(err, &notImplemented) {
-		t.Fatalf("Append error = %T %v, want *NotImplementedError", err, err)
-	}
-	if notImplemented.Operation != "Ledger.Append" {
-		t.Errorf("NotImplementedError.Operation = %q, want %q", notImplemented.Operation, "Ledger.Append")
 	}
 }

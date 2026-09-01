@@ -33,9 +33,8 @@ type Store struct {
 
 var newPool = pgxpool.NewWithConfig
 
-// Open validates options, requires a caller deadline, creates a lazy pgx pool,
-// and wires the P1.1 adapter seams. It does not ping or migrate PostgreSQL;
-// disposable database setup and the first schema belong to P1.2.
+// Open validates options, requires a caller deadline, creates the pool, and
+// applies or validates the configured schema migration policy before returning.
 func Open(ctx context.Context, options Options) (*Store, error) {
 	resolved, err := options.resolve()
 	if err != nil {
@@ -49,6 +48,10 @@ func Open(ctx context.Context, options Options) (*Store, error) {
 		// NewWithConfig validates already-parsed configuration. Do not expose its
 		// text because driver errors may retain connection details.
 		return nil, invalidOption("DSN", "PostgreSQL pool configuration was rejected")
+	}
+	if err := migrate(ctx, pool, resolved.schema, resolved.tablePrefix, resolved.migrations); err != nil {
+		pool.Close()
+		return nil, err
 	}
 	return &Store{
 		Ledger:       ledger.New(pool, resolved.schema, resolved.tablePrefix),

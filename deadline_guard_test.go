@@ -46,10 +46,6 @@ func TestStructuredOperationMethodsCallDeadlineGuard(t *testing.T) {
 				position := fileSet.Position(function.Pos())
 				t.Errorf("%s:%d %s does not call guard.RequireDeadline", path, position.Line, function.Name.Name)
 			}
-			if !callsGuard(function.Body, "NotImplemented") {
-				position := fileSet.Position(function.Pos())
-				t.Errorf("%s:%d %s does not call guard.NotImplemented", path, position.Line, function.Name.Name)
-			}
 		}
 	}
 	if operations == 0 {
