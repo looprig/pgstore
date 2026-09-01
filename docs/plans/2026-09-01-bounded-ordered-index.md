@@ -54,7 +54,9 @@
    stable-key/order-scope ties, moves, tombstones, query mismatch, wrong kind,
    malformed/unknown/oversize/noncanonical cursor, and cancellation.
 2. Implement strict bounded cursor encoding/decoding.
-3. Implement the three SQL keyset queries with `limit+1` exhaustion detection.
+3. Implement all three SQL keyset queries. Ranked and due pages use `limit+1`
+   exhaustion detection; `ListOrdered` uses `limit` because `OrderedPage` has
+   no exhaustion sentinel.
 4. Run provider tests and the entire released StoreTest green.
 
 ### Task 4: Ambiguity, plans, source guards, and redaction
