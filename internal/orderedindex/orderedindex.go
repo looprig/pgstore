@@ -148,7 +148,7 @@ func (s *Store) createOnce(ctx context.Context, id storage.OrderedID, rankingSco
 	}
 	storedValue, valueIsNil := databaseValue(value)
 	record := storage.OrderedRecord{ID: id, RankingScope: rankingScope, Revision: 1, Order: order, Value: cloneValue(value), Rank: rank, Due: due}
-	_, err = tx.Exec(ctx, "INSERT INTO "+s.recordsTable()+" (namespace, ordering_scope, stable_key, ranking_scope, revision, order_id, value, value_is_nil, ranked, rank_value, due_state, due_at, deleted) VALUES ($1, $2, $3, $4, 1, $5::numeric, $6, $7, $8, $9, $10, $11, false)", id.Namespace, id.OrderingScope, string(id.StableKey), rankingScope, orderText, storedValue, valueIsNil, rank.Ranked, rank.Value, int16(due.State), due.UnixMillis)
+	_, err = tx.Exec(ctx, "INSERT INTO "+s.recordsTable()+" (namespace, ordering_scope, stable_key, ranking_scope, revision, order_id, value, value_is_nil, ranked, rank_value, due_state, due_at, deleted) VALUES ($1, $2, $3, $4, 1, $5::numeric, $6, $7, $8, $9, $10, $11, false)", id.Namespace, id.OrderingScope, stableKeyBytes(id.StableKey), rankingScope, orderText, storedValue, valueIsNil, rank.Ranked, rank.Value, int16(due.State), due.UnixMillis)
 	if err != nil {
 		return storage.OrderedRecord{}, false, err
 	}
@@ -226,7 +226,7 @@ func (s *Store) updateOnce(ctx context.Context, id storage.OrderedID, expectedRe
 	next := current
 	next.Revision++
 	next.Value, next.Rank, next.Due = cloneValue(value), rank, due
-	_, err = tx.Exec(ctx, "UPDATE "+s.recordsTable()+" SET revision = revision + 1, value = $4, value_is_nil = $5, ranked = $6, rank_value = $7, due_state = $8, due_at = $9 WHERE namespace = $1 AND ordering_scope = $2 AND stable_key = $3", id.Namespace, id.OrderingScope, string(id.StableKey), storedValue, valueIsNil, rank.Ranked, rank.Value, int16(due.State), due.UnixMillis)
+	_, err = tx.Exec(ctx, "UPDATE "+s.recordsTable()+" SET revision = revision + 1, value = $4, value_is_nil = $5, ranked = $6, rank_value = $7, due_state = $8, due_at = $9 WHERE namespace = $1 AND ordering_scope = $2 AND stable_key = $3", id.Namespace, id.OrderingScope, stableKeyBytes(id.StableKey), storedValue, valueIsNil, rank.Ranked, rank.Value, int16(due.State), due.UnixMillis)
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
@@ -296,7 +296,7 @@ func (s *Store) deleteOnce(ctx context.Context, id storage.OrderedID, expectedRe
 	}
 	next := current
 	next.Revision, next.Deleted, next.Rank, next.Due = next.Revision+1, true, storage.Rank{}, storage.Due{State: storage.NotDue}
-	_, err = tx.Exec(ctx, "UPDATE "+s.recordsTable()+" SET revision = revision + 1, ranked = false, rank_value = 0, due_state = 0, due_at = 0, deleted = true WHERE namespace = $1 AND ordering_scope = $2 AND stable_key = $3", id.Namespace, id.OrderingScope, string(id.StableKey))
+	_, err = tx.Exec(ctx, "UPDATE "+s.recordsTable()+" SET revision = revision + 1, ranked = false, rank_value = 0, due_state = 0, due_at = 0, deleted = true WHERE namespace = $1 AND ordering_scope = $2 AND stable_key = $3", id.Namespace, id.OrderingScope, stableKeyBytes(id.StableKey))
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
@@ -357,7 +357,7 @@ func (s *Store) ListRanked(ctx context.Context, namespace, rankingScope string, 
 	query, args := "SELECT "+recordColumns+" FROM "+s.recordsTable()+" WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted", []any{namespace, rankingScope}
 	if hasPosition {
 		query += " AND (rank_value, stable_key, ordering_scope) < ($3, $4, $5)"
-		args = append(args, position.rank, string(position.stableKey), position.orderingScope)
+		args = append(args, position.rank, stableKeyBytes(position.stableKey), position.orderingScope)
 	}
 	query += " ORDER BY rank_value DESC, stable_key DESC, ordering_scope DESC LIMIT $" + strconv.Itoa(len(args)+1)
 	args = append(args, limit+1)
@@ -396,7 +396,7 @@ func (s *Store) ListDue(ctx context.Context, namespace string, dueAtOrBefore int
 	query, args := "SELECT "+recordColumns+" FROM "+s.recordsTable()+" WHERE namespace = $1 AND due_state = 1 AND NOT deleted AND due_at <= $2", []any{namespace, dueAtOrBefore}
 	if hasPosition {
 		query += " AND (due_at, stable_key, ordering_scope) > ($3, $4, $5)"
-		args = append(args, position.dueAt, string(position.stableKey), position.orderingScope)
+		args = append(args, position.dueAt, stableKeyBytes(position.stableKey), position.orderingScope)
 	}
 	query += " ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT $" + strconv.Itoa(len(args)+1)
 	args = append(args, limit+1)
@@ -429,7 +429,7 @@ func (s *Store) get(ctx context.Context, id storage.OrderedID) (storage.OrderedR
 	return s.getFrom(ctx, s.pool, id, "")
 }
 func (s *Store) getFrom(ctx context.Context, queryer queryRower, id storage.OrderedID, suffix string) (storage.OrderedRecord, error) {
-	return scanRecord(queryer.QueryRow(ctx, "SELECT "+recordColumns+" FROM "+s.recordsTable()+" WHERE namespace = $1 AND ordering_scope = $2 AND stable_key = $3"+suffix, id.Namespace, id.OrderingScope, string(id.StableKey)))
+	return scanRecord(queryer.QueryRow(ctx, "SELECT "+recordColumns+" FROM "+s.recordsTable()+" WHERE namespace = $1 AND ordering_scope = $2 AND stable_key = $3"+suffix, id.Namespace, id.OrderingScope, stableKeyBytes(id.StableKey)))
 }
 
 func (s *Store) getForUpdate(ctx context.Context, tx pgx.Tx, id storage.OrderedID) (storage.OrderedRecord, error) {
@@ -438,14 +438,15 @@ func (s *Store) getForUpdate(ctx context.Context, tx pgx.Tx, id storage.OrderedI
 
 func scanRecord(row rowScanner) (storage.OrderedRecord, error) {
 	var record storage.OrderedRecord
-	var revisionText, orderText, stableKey string
+	var revisionText, orderText string
+	var stableKey []byte
 	var valueIsNil bool
 	var dueState int16
 	err := row.Scan(&record.ID.Namespace, &record.ID.OrderingScope, &stableKey, &record.RankingScope, &revisionText, &orderText, &record.Value, &valueIsNil, &record.Rank.Ranked, &record.Rank.Value, &dueState, &record.Due.UnixMillis, &record.Deleted)
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
-	record.ID.StableKey = storage.StableKey(stableKey)
+	record.ID.StableKey = storage.StableKey(string(stableKey))
 	if record.Revision, err = parseUint(revisionText); err != nil {
 		return storage.OrderedRecord{}, err
 	}
@@ -510,6 +511,9 @@ func databaseValue(value []byte) ([]byte, bool) {
 		return []byte{}, true
 	}
 	return value, false
+}
+func stableKeyBytes(key storage.StableKey) []byte {
+	return []byte(string(key))
 }
 func (s *Store) scopesTable() string {
 	return pginternal.Qualified(s.schema, s.tablePrefix+orderedScopesSuffix)

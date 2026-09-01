@@ -14,7 +14,7 @@ type outOfRangeDueRow struct{}
 func (outOfRangeDueRow) Scan(dest ...any) error {
 	*dest[0].(*string) = "sessions"
 	*dest[1].(*string) = "acceptance"
-	*dest[2].(*string) = "key"
+	*dest[2].(*[]byte) = []byte("key")
 	*dest[3].(*string) = "workers"
 	*dest[4].(*string) = "1"
 	*dest[5].(*string) = "1"

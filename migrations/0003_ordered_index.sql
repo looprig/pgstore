@@ -8,7 +8,7 @@ CREATE TABLE {{schema}}.{{ordered_scopes}} (
 CREATE TABLE {{schema}}.{{ordered_records}} (
     namespace text COLLATE "C" NOT NULL,
     ordering_scope text COLLATE "C" NOT NULL,
-    stable_key text COLLATE "C" NOT NULL,
+    stable_key bytea NOT NULL,
     ranking_scope text COLLATE "C" NOT NULL,
     revision numeric(20, 0) NOT NULL CHECK (revision > 0 AND revision <= 18446744073709551615),
     order_id numeric(20, 0) NOT NULL CHECK (order_id > 0 AND order_id <= 18446744073709551615),

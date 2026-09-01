@@ -3,6 +3,7 @@
 package orderedindex
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -40,7 +41,7 @@ CREATE TABLE `+schema+`.test_ordered_scopes (
  PRIMARY KEY (namespace, ordering_scope));
 CREATE TABLE `+schema+`.test_ordered_records (
  namespace text COLLATE "C" NOT NULL, ordering_scope text COLLATE "C" NOT NULL,
- stable_key text COLLATE "C" NOT NULL, ranking_scope text COLLATE "C" NOT NULL,
+ stable_key bytea NOT NULL, ranking_scope text COLLATE "C" NOT NULL,
  revision numeric(20,0) NOT NULL, order_id numeric(20,0) NOT NULL,
  value bytea NOT NULL, value_is_nil boolean NOT NULL, ranked boolean NOT NULL,
  rank_value bigint NOT NULL, due_state smallint NOT NULL, due_at bigint NOT NULL,
@@ -119,7 +120,7 @@ func TestCommitAcknowledgementLossResolvesOnlyExactPostState(t *testing.T) {
 		if err := tx.Commit(ctx); err != nil {
 			return err
 		}
-		_, execErr := pool.Exec(ctx, `UPDATE `+store.recordsTable()+` SET revision = revision + 1, value = 'later'::bytea WHERE namespace = $1 AND ordering_scope = $2 AND stable_key = $3`, laterBase.ID.Namespace, laterBase.ID.OrderingScope, string(laterBase.ID.StableKey))
+		_, execErr := pool.Exec(ctx, `UPDATE `+store.recordsTable()+` SET revision = revision + 1, value = 'later'::bytea WHERE namespace = $1 AND ordering_scope = $2 AND stable_key = $3`, laterBase.ID.Namespace, laterBase.ID.OrderingScope, stableKeyBytes(laterBase.ID.StableKey))
 		if execErr != nil {
 			return execErr
 		}
@@ -167,7 +168,7 @@ func TestRevisionAndOrderExhaustionLeaveAuthoritativeStateUntouched(t *testing.T
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "UPDATE "+store.recordsTable()+" SET revision=$4::numeric WHERE namespace=$1 AND ordering_scope=$2 AND stable_key=$3", id.Namespace, id.OrderingScope, string(id.StableKey), fmt.Sprint(uint64(math.MaxUint64))); err != nil {
+	if _, err := pool.Exec(ctx, "UPDATE "+store.recordsTable()+" SET revision=$4::numeric WHERE namespace=$1 AND ordering_scope=$2 AND stable_key=$3", id.Namespace, id.OrderingScope, stableKeyBytes(id.StableKey), fmt.Sprint(uint64(math.MaxUint64))); err != nil {
 		t.Fatalf("seed maximal revision: %v", err)
 	}
 	for name, operation := range map[string]func() error{
@@ -220,6 +221,92 @@ func TestNilAndEmptyValuesRemainDistinctCallerOwnedSnapshots(t *testing.T) {
 			t.Errorf("Get(%s) nil=%v, err %v; want nil=%v", want.ID.StableKey, got.Value == nil, err, want.Value == nil)
 		}
 	}
+}
+
+func TestEmbeddedNULStableKeysRoundTripAndPageBytewise(t *testing.T) {
+	store, _ := newIntegrationStore(t)
+	ctx := boundedContext(t)
+	keys := []storage.StableKey{"\x00", "a", "a\x00", "snowman-☃"}
+	for _, key := range keys {
+		id := storage.OrderedID{Namespace: "sessions", OrderingScope: "nul-keys", StableKey: key}
+		created, won, err := store.Create(ctx, id, "nul-workers", []byte("value:"+string(key)), storage.Rank{Ranked: true, Value: 7}, storage.Due{State: storage.DueAt, UnixMillis: 11})
+		if err != nil || !won {
+			t.Fatalf("Create(%q) = %#v, %v, %v; want created record", key, created, won, err)
+		}
+		got, err := store.Get(ctx, id)
+		if err != nil || got.ID != id || !bytes.Equal(got.Value, created.Value) {
+			t.Fatalf("Get(%q) = %#v, %v; want exact created record", key, got, err)
+		}
+	}
+
+	ordered, err := store.ListOrdered(ctx, "sessions", "nul-keys", 0, len(keys))
+	if err != nil || len(ordered.Records) != len(keys) {
+		t.Fatalf("ListOrdered embedded-NUL records = %#v, %v", ordered.Records, err)
+	}
+	for i, record := range ordered.Records {
+		if record.ID.StableKey != keys[i] {
+			t.Errorf("ListOrdered key[%d] = %q, want creation-order %q", i, record.ID.StableKey, keys[i])
+		}
+	}
+
+	wantAscending := keys
+	wantDescending := []storage.StableKey{"snowman-☃", "a\x00", "a", "\x00"}
+	if got := collectDueKeys(t, ctx, store, "sessions", 11); !equalStableKeys(got, wantAscending) {
+		t.Errorf("ListDue embedded-NUL page order = %q, want bytewise ascending %q", got, wantAscending)
+	}
+	if got := collectRankedKeys(t, ctx, store, "sessions", "nul-workers"); !equalStableKeys(got, wantDescending) {
+		t.Errorf("ListRanked embedded-NUL page order = %q, want bytewise descending %q", got, wantDescending)
+	}
+}
+
+func collectDueKeys(t *testing.T, ctx context.Context, store *Store, namespace string, bound int64) []storage.StableKey {
+	t.Helper()
+	var keys []storage.StableKey
+	var cursor storage.DueCursor
+	for {
+		page, err := store.ListDue(ctx, namespace, bound, cursor, 1)
+		if err != nil {
+			t.Fatalf("ListDue cursor %q: %v", cursor, err)
+		}
+		for _, record := range page.Records {
+			keys = append(keys, record.ID.StableKey)
+		}
+		if page.NextCursor == "" {
+			return keys
+		}
+		cursor = page.NextCursor
+	}
+}
+
+func collectRankedKeys(t *testing.T, ctx context.Context, store *Store, namespace, scope string) []storage.StableKey {
+	t.Helper()
+	var keys []storage.StableKey
+	var cursor storage.RankedCursor
+	for {
+		page, err := store.ListRanked(ctx, namespace, scope, cursor, 1)
+		if err != nil {
+			t.Fatalf("ListRanked cursor %q: %v", cursor, err)
+		}
+		for _, record := range page.Records {
+			keys = append(keys, record.ID.StableKey)
+		}
+		if page.NextCursor == "" {
+			return keys
+		}
+		cursor = page.NextCursor
+	}
+}
+
+func equalStableKeys(a, b []storage.StableKey) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestConcurrentDuplicateConsumesExactlyOneCounterValue(t *testing.T) {

@@ -16,6 +16,13 @@ inside an explicit Read Committed transaction, then rechecks identity, advances 
 counter, and inserts the record atomically. Duplicate identities return their stored record
 without validating candidate fields or advancing the counter.
 
+Stable keys use PostgreSQL `bytea`, not `text`. Storage accepts every valid UTF-8
+value from 1 through 256 bytes, including U+0000, which PostgreSQL text cannot
+represent. The provider binds and scans the original UTF-8 bytes while cursors retain
+their canonical JSON string form. PostgreSQL's `bytea` B-tree comparison is
+lexicographic over those bytes, preserving the released stable-key tuple order for
+valid UTF-8 while covering the contract's complete value domain.
+
 Update and Delete lock one authoritative row and implement the exact validation,
 tombstone, CAS, and revision-exhaustion precedence from Storage. Rank and due moves
 change in the same statement as value and revision. Serialization/deadlock errors,

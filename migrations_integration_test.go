@@ -121,6 +121,13 @@ func TestMigrationAddsOrderedIndexTablesAndExactIndexes(t *testing.T) {
 			t.Errorf("migration did not create %s", table)
 		}
 	}
+	var stableKeyType string
+	if err := admin.QueryRow(ctx, `SELECT data_type FROM information_schema.columns WHERE table_schema='migrationordered' AND table_name='exact_ordered_records' AND column_name='stable_key'`).Scan(&stableKeyType); err != nil {
+		t.Fatalf("read stable_key type: %v", err)
+	}
+	if stableKeyType != "bytea" {
+		t.Fatalf("stable_key type = %q, want bytea for the full valid UTF-8 domain", stableKeyType)
+	}
 
 	wantIndexes := map[string]string{
 		"exact_ordered_records_pkey": "namespace, ordering_scope, stable_key",
@@ -159,11 +166,11 @@ func TestMigrationAddsOrderedIndexTablesAndExactIndexes(t *testing.T) {
 		sql  string
 	}{
 		{name: "negative counter", sql: `INSERT INTO migrationordered.exact_ordered_scopes VALUES ('sessions','bad-counter',-1)`},
-		{name: "zero revision", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope','zero-revision','workers',0,1,''::bytea,false,false,0,0,0,false)`},
-		{name: "zero order", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope','zero-order','workers',1,0,''::bytea,false,false,0,0,0,false)`},
-		{name: "oversized value", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope','large','workers',1,1,decode(repeat('00',1048577),'hex'),false,false,0,0,0,false)`},
-		{name: "noncanonical due", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope','bad-due','workers',1,1,''::bytea,false,false,0,0,1,false)`},
-		{name: "active tombstone", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope','bad-delete','workers',1,1,''::bytea,false,true,1,1,1,true)`},
+		{name: "zero revision", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope',convert_to('zero-revision','UTF8'),'workers',0,1,''::bytea,false,false,0,0,0,false)`},
+		{name: "zero order", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope',convert_to('zero-order','UTF8'),'workers',1,0,''::bytea,false,false,0,0,0,false)`},
+		{name: "oversized value", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope',convert_to('large','UTF8'),'workers',1,1,decode(repeat('00',1048577),'hex'),false,false,0,0,0,false)`},
+		{name: "noncanonical due", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope',convert_to('bad-due','UTF8'),'workers',1,1,''::bytea,false,false,0,0,1,false)`},
+		{name: "active tombstone", sql: `INSERT INTO ` + recordTable + ` VALUES ('sessions','scope',convert_to('bad-delete','UTF8'),'workers',1,1,''::bytea,false,true,1,1,1,true)`},
 	}
 	for _, invalid := range invalidRows {
 		if _, err := admin.Exec(ctx, invalid.sql); err == nil {

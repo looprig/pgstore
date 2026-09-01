@@ -23,6 +23,9 @@ transactional per-scope counter. Order, rank, and due listings use purpose-built
 B-tree keysets rather than `OFFSET` or global sorting. Ranked and due cursors are
 bounded, versioned, opaque continuation positions bound to the complete query;
 their opacity protects pagination integrity and is not an authorization boundary.
+Stable keys are stored and indexed as their original UTF-8 bytes rather than
+PostgreSQL text, so the released 1–256-byte domain includes embedded U+0000 while
+retaining bytewise ranked and due tuple order.
 
 An operation whose acknowledgement is lost is resolved by an authoritative
 reread, never by a cached value. For `Ledger.Append` that reread reports success

@@ -29,7 +29,7 @@ func TestOrderedIndexPlansUseExactKeysetIndexesForFirstAndMiddlePages(t *testing
 	admin := adminPool(t)
 	table := pginternal.Qualified("looprig", prefix+"ordered_records")
 	_, err = admin.Exec(ctx, `INSERT INTO `+table+` (namespace, ordering_scope, stable_key, ranking_scope, revision, order_id, value, value_is_nil, ranked, rank_value, due_state, due_at, deleted)
-SELECT 'sessions', 'scope-' || (g % 10)::text, 'key-' || lpad(((g - 1) / 10)::text, 6, '0'), 'workers', 1, ((g - 1) / 10) + 1,
+SELECT 'sessions', 'scope-' || (g % 10)::text, convert_to('key-' || lpad(((g - 1) / 10)::text, 6, '0'), 'UTF8'), 'workers', 1, ((g - 1) / 10) + 1,
        convert_to('value', 'UTF8'), false, true, (g % 100), 1, (g % 1000), false
 FROM generate_series(1, 10000) AS g`)
 	if err != nil {
@@ -60,12 +60,12 @@ FROM generate_series(1, 10000) AS g`)
 		{name: "order first", indexName: prefix + "ordered_order_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND ordering_scope=$2 AND order_id > $3::numeric ORDER BY order_id ASC, stable_key ASC LIMIT 25`, args: []any{"sessions", "scope-1", "0"}},
 		{name: "order middle", indexName: prefix + "ordered_order_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND ordering_scope=$2 AND order_id > $3::numeric ORDER BY order_id ASC, stable_key ASC LIMIT 25`, args: []any{"sessions", "scope-1", "500"}},
 		{name: "rank first", indexName: prefix + "ordered_rank_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND ranking_scope=$2 AND ranked AND NOT deleted ORDER BY rank_value DESC, stable_key DESC, ordering_scope DESC LIMIT 25`, args: []any{"sessions", "workers"}},
-		{name: "rank middle", indexName: prefix + "ordered_rank_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND ranking_scope=$2 AND ranked AND NOT deleted AND (rank_value,stable_key,ordering_scope) < ($3,$4,$5) ORDER BY rank_value DESC, stable_key DESC, ordering_scope DESC LIMIT 25`, args: []any{"sessions", "workers", int64(50), "key-000500", "scope-5"}},
+		{name: "rank middle", indexName: prefix + "ordered_rank_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND ranking_scope=$2 AND ranked AND NOT deleted AND (rank_value,stable_key,ordering_scope) < ($3,$4,$5) ORDER BY rank_value DESC, stable_key DESC, ordering_scope DESC LIMIT 25`, args: []any{"sessions", "workers", int64(50), []byte("key-000500"), "scope-5"}},
 		// Storage v0.6.0 ListDue has no scope argument. Both pages must use the
 		// namespace+state+due tuple index, proving the runbook shorthand was not
 		// accidentally implemented as an API-incompatible scope filter.
 		{name: "due first no invented scope", indexName: prefix + "ordered_due_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND due_state=1 AND NOT deleted AND due_at <= $2 ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT 25`, args: []any{"sessions", int64(999)}},
-		{name: "due middle no invented scope", indexName: prefix + "ordered_due_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND due_state=1 AND NOT deleted AND due_at <= $2 AND (due_at,stable_key,ordering_scope) > ($3,$4,$5) ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT 25`, args: []any{"sessions", int64(999), int64(500), "key-000500", "scope-5"}},
+		{name: "due middle no invented scope", indexName: prefix + "ordered_due_idx", query: `SELECT ` + orderedExplainColumns + ` FROM ` + table + ` WHERE namespace=$1 AND due_state=1 AND NOT deleted AND due_at <= $2 AND (due_at,stable_key,ordering_scope) > ($3,$4,$5) ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT 25`, args: []any{"sessions", int64(999), int64(500), []byte("key-000500"), "scope-5"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

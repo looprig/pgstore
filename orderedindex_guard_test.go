@@ -37,6 +37,7 @@ func TestOrderedIndexMigrationCarriesExactPhysicalIndexes(t *testing.T) {
 	}
 	statement := string(source)
 	for _, required := range []string{
+		"stable_key bytea NOT NULL",
 		"PRIMARY KEY (namespace, ordering_scope, stable_key)",
 		"(namespace, ordering_scope, order_id, stable_key)",
 		"(namespace, ranking_scope, rank_value DESC, stable_key DESC, ordering_scope DESC)",
@@ -45,6 +46,9 @@ func TestOrderedIndexMigrationCarriesExactPhysicalIndexes(t *testing.T) {
 		if !strings.Contains(statement, required) {
 			t.Errorf("OrderedIndex migration lost exact index %q", required)
 		}
+	}
+	if strings.Contains(statement, `stable_key text`) {
+		t.Fatal("OrderedIndex migration cannot represent embedded-NUL StableKeys in PostgreSQL text")
 	}
 	if strings.Contains(statement, "due_state, ordering_scope") {
 		t.Fatal("due index invented a scope filter absent from Storage v0.6.0 ListDue")
