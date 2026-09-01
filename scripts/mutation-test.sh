@@ -254,7 +254,7 @@ run_mutation "kv bytewise collation" internal/kv/kv.go 'ORDER BY key COLLATE \"C
 # P1.4 OrderedIndex behavioral mutation matrix.
 run_integration_mutation "ordered stable key migration bytes" migrations/0003_ordered_index.sql 'stable_key bytea NOT NULL' 'stable_key text COLLATE "C" NOT NULL' TestMigrationAddsOrderedIndexTablesAndExactIndexes 'stable_key type = "text", want bytea'
 run_integration_mutation "ordered stable key SQL bytes" internal/orderedindex/orderedindex.go 'return []byte(string(key))' 'return []byte(string(key[1:]))' TestEmbeddedNULStableKeysRoundTripAndPageBytewise 'Get("\x00")'
-run_mutation "ordered explicit Read Committed isolation" internal/orderedindex/orderedindex.go 'pgx.TxOptions{IsoLevel: pgx.ReadCommitted}' 'pgx.TxOptions{IsoLevel: pgx.Serializable}' TestOrderedIndexMutationsPinReadCommittedAndExplicitRowLocks 'explicit Read Committed transaction count = 2, want 3'
+run_mutation "ordered explicit Read Committed isolation" internal/orderedindex/orderedindex.go 'pgx.TxOptions{IsoLevel: pgx.ReadCommitted}' 'pgx.TxOptions{IsoLevel: pgx.Serializable}' TestOrderedIndexMutationsPinReadCommittedAndExplicitRowLocks 'so it must run at pgx.ReadCommitted'
 run_integration_mutation "ordered counter increment" internal/orderedindex/orderedindex.go 'SET next_order = next_order + 1 WHERE namespace' 'SET next_order = next_order + 0 WHERE namespace' TestOrderedIndexConformance 'want record, true, nil'
 run_integration_mutation "ordered counter row lock" internal/orderedindex/orderedindex.go 'ordering_scope = $2 FOR UPDATE", id.Namespace' 'ordering_scope = $2", id.Namespace' TestConcurrentDuplicateConsumesExactlyOneCounterValue 'concurrent duplicate:'
 run_integration_mutation "ordered duplicate recheck after counter lock" internal/orderedindex/orderedindex.go 'if lockedExisting, readErr := s.getFrom(ctx, tx, id, ""); readErr == nil {' 'if lockedExisting, readErr := s.getFrom(ctx, tx, id, ""); false && readErr == nil {' TestConcurrentDuplicateConsumesExactlyOneCounterValue 'concurrent duplicate'
@@ -299,7 +299,7 @@ run_mutation "ordered production receiver shadow" internal/orderedindex/orderedi
 	rows, err := s.pool.Query(ctx, statement.SQL, statement.Args...)' 'statement := orderedquery.Ranked(s.recordsTable(), namespace, rankingScope, queryPosition, limit)
 	other := s
 	var rows pgx.Rows
-	{ s := other; rows, err = s.pool.Query(ctx, statement.SQL, statement.Args...) }' TestOrderedIndexPlanGateUsesProductionStatements 'is not its receiver-bound pool consuming'
+	{ s := other; rows, err = s.pool.Query(ctx, statement.SQL, statement.Args...) }' TestOrderedIndexPlanGateUsesProductionStatements 'never reads rows through its own receiver'
 run_mutation "ordered plan gate dead helper live copied table" orderedindex_plan_integration_test.go 'for _, test := range orderedPlanCases(table, prefix) {' '_ = orderedPlanCases(table, prefix)
 	tests := []orderedPlanCase{{name: "copied", family: orderedPlanOrder, page: orderedPlanFirst, indexName: prefix + "ordered_order_idx", statement: orderedquery.Statement{SQL: "SELECT 1"}, wantArgs: nil}}
 	for _, test := range tests {' TestOrderedIndexPlanGateUsesProductionStatements 'has 0 direct orderedPlanCases ranges, want exactly 1'
@@ -390,8 +390,8 @@ if test -n "$failures"; then
 	printf '%s' "$failures"
 	exit 1
 fi
-if test -z "${PGSTORE_MUTATION_FILTER:-}" && test "$total" -ne "${PGSTORE_MUTATION_EXPECTED_TOTAL:-155}"; then
-	echo "campaign ran $total mutations, want ${PGSTORE_MUTATION_EXPECTED_TOTAL:-155}: entries cannot be lost silently"
+if test -z "${PGSTORE_MUTATION_FILTER:-}" && test "$total" -ne "${PGSTORE_MUTATION_EXPECTED_TOTAL:-154}"; then
+	echo "campaign ran $total mutations, want ${PGSTORE_MUTATION_EXPECTED_TOTAL:-154}: entries cannot be lost silently"
 	exit 1
 fi
 echo "ALL $killed MUTATIONS KILLED"

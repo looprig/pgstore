@@ -1371,6 +1371,13 @@ func validateProductionStatementOwnership(source []byte) error {
 		// would reject a legal implementation without protecting anything.
 		receivers := append([]*ast.Ident{receiver}, bindingsFromCall(function.Body, "BeginTx", []*ast.Ident{receiver})...)
 		reads := rowReturningCallsOn(function.Body, receivers)
+		if len(reads) == 0 {
+			// Distinct from the count message below: rows may well be read
+			// here, just not through the receiver this guard binds. A shadowed
+			// or foreign receiver is exactly how a page arrives from somewhere
+			// the guard cannot see.
+			return fmt.Errorf("List%s never reads rows through its own receiver's pool; a page read on a shadowed or foreign receiver is not the statement this guard binds", family)
+		}
 		if len(reads) != 1 {
 			return fmt.Errorf("List%s reads rows %d times (%s). The page must come from the one orderedquery statement, so exactly one Query is allowed.", family, len(reads), strings.Join(callNames(reads), ", "))
 		}
