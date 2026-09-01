@@ -50,3 +50,23 @@ func TestOrderedIndexMigrationCarriesExactPhysicalIndexes(t *testing.T) {
 		t.Fatal("due index invented a scope filter absent from Storage v0.6.0 ListDue")
 	}
 }
+
+func TestOrderedIndexMutationsPinReadCommittedAndExplicitRowLocks(t *testing.T) {
+	source, err := os.ReadFile("internal/orderedindex/orderedindex.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	if got := strings.Count(text, "IsoLevel: pgx.ReadCommitted"); got != 3 {
+		t.Fatalf("OrderedIndex explicit Read Committed transaction count = %d, want 3", got)
+	}
+	if strings.Contains(text, "pgx.Serializable") {
+		t.Fatal("OrderedIndex uses Serializable despite its per-scope and per-row lock protocol")
+	}
+	if !strings.Contains(text, "WHERE namespace = $1 AND ordering_scope = $2 FOR UPDATE") {
+		t.Fatal("OrderedIndex Create lost its per-scope counter row lock")
+	}
+	if !strings.Contains(text, `return s.getFrom(ctx, tx, id, " FOR UPDATE")`) {
+		t.Fatal("OrderedIndex Update/Delete lost their shared authoritative-row lock")
+	}
+}

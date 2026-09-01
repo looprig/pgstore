@@ -217,8 +217,12 @@ run_integration_mutation "kv prefix parameterization" internal/kv/kv.go '"SELECT
 run_mutation "kv bytewise collation" internal/kv/kv.go 'ORDER BY key COLLATE \"C\"' 'ORDER BY key' TestKVKeysPinsBytewiseCollation 'does not pin ORDER BY'
 
 # P1.4 OrderedIndex behavioral mutation matrix.
+run_mutation "ordered explicit Read Committed isolation" internal/orderedindex/orderedindex.go 'pgx.TxOptions{IsoLevel: pgx.ReadCommitted}' 'pgx.TxOptions{IsoLevel: pgx.Serializable}' TestOrderedIndexMutationsPinReadCommittedAndExplicitRowLocks 'explicit Read Committed transaction count = 2, want 3'
 run_integration_mutation "ordered counter increment" internal/orderedindex/orderedindex.go 'SET next_order = next_order + 1 WHERE namespace' 'SET next_order = next_order + 0 WHERE namespace' TestOrderedIndexConformance 'want record, true, nil'
+run_integration_mutation "ordered counter row lock" internal/orderedindex/orderedindex.go 'ordering_scope = $2 FOR UPDATE", id.Namespace' 'ordering_scope = $2", id.Namespace' TestConcurrentDuplicateConsumesExactlyOneCounterValue 'concurrent duplicate:'
 run_integration_mutation "ordered duplicate recheck after counter lock" internal/orderedindex/orderedindex.go 'if lockedExisting, readErr := s.getFrom(ctx, tx, id, ""); readErr == nil {' 'if lockedExisting, readErr := s.getFrom(ctx, tx, id, ""); false && readErr == nil {' TestConcurrentDuplicateConsumesExactlyOneCounterValue 'concurrent duplicate'
+run_integration_mutation "ordered update authoritative row lock" internal/orderedindex/orderedindex.go 'return s.getFrom(ctx, tx, id, " FOR UPDATE")' 'return s.getFrom(ctx, tx, id, "")' TestConcurrentUpdateCASHasExactlyOneWinner 'want 1/15'
+run_integration_mutation "ordered delete authoritative row lock" internal/orderedindex/orderedindex.go 'return s.getFrom(ctx, tx, id, " FOR UPDATE")' 'return s.getFrom(ctx, tx, id, "")' TestConcurrentDeleteAdvancesRevisionExactlyOnce 'want true/2'
 run_integration_mutation "ordered atomic rank move" internal/orderedindex/orderedindex.go 'ranked = $6, rank_value = $7' 'ranked = NOT $6, rank_value = $7' TestOrderedIndexConformance 'Rank false/99'
 run_integration_mutation "ordered atomic due move" internal/orderedindex/orderedindex.go 'due_state = $8, due_at = $9' 'due_state = $8, due_at = $9 + 1' TestOrderedIndexConformance 'Due 1/-4'
 run_integration_mutation "ordered order keyset direction" internal/orderedindex/orderedindex.go 'order_id > $3::numeric' 'order_id < $3::numeric' TestOrderedIndexConformance 'ListOrdered'

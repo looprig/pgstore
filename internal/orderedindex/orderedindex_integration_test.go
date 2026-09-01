@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -225,6 +226,14 @@ func TestConcurrentDuplicateConsumesExactlyOneCounterValue(t *testing.T) {
 	store, pool := newIntegrationStore(t)
 	ctx := boundedContext(t)
 	id := orderedID("contended-counter")
+	if _, err := pool.Exec(ctx, "INSERT INTO "+store.scopesTable()+" (namespace, ordering_scope, next_order) VALUES ($1, $2, 0)", id.Namespace, id.OrderingScope); err != nil {
+		t.Fatalf("preseed counter row: %v", err)
+	}
+	function := fmt.Sprintf("%s.slow_ordered_counter_update", store.schema)
+	if _, err := pool.Exec(ctx, `CREATE FUNCTION `+function+`() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.1); RETURN NEW; END $$;
+CREATE TRIGGER slow_ordered_counter_update BEFORE UPDATE ON `+store.scopesTable()+` FOR EACH ROW EXECUTE FUNCTION `+function+`()`); err != nil {
+		t.Fatalf("install slow counter trigger: %v", err)
+	}
 	const writers = 32
 	start := make(chan struct{})
 	type result struct {
@@ -263,6 +272,108 @@ func TestConcurrentDuplicateConsumesExactlyOneCounterValue(t *testing.T) {
 	}
 	if nextOrder != 1 {
 		t.Fatalf("counter after duplicate race = %d, want exactly 1", nextOrder)
+	}
+}
+
+func installSlowUpdateTrigger(t *testing.T, ctx context.Context, pool *pgxpool.Pool, store *Store) {
+	t.Helper()
+	function := fmt.Sprintf("%s.slow_ordered_update", store.schema)
+	if _, err := pool.Exec(ctx, `CREATE FUNCTION `+function+`() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.05); RETURN NEW; END $$;
+CREATE TRIGGER slow_ordered_update BEFORE UPDATE ON `+store.recordsTable()+` FOR EACH ROW EXECUTE FUNCTION `+function+`()`); err != nil {
+		t.Fatalf("install slow update trigger: %v", err)
+	}
+}
+
+func TestConcurrentUpdateCASHasExactlyOneWinner(t *testing.T) {
+	store, pool := newIntegrationStore(t)
+	ctx := boundedContext(t)
+	id := orderedID("contended-update")
+	created, _, err := store.Create(ctx, id, "workers", []byte("before"), storage.Rank{}, storage.Due{State: storage.NotDue})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	installSlowUpdateTrigger(t, ctx, pool, store)
+
+	const writers = 16
+	start := make(chan struct{})
+	results := make(chan error, writers)
+	var wg sync.WaitGroup
+	for writer := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := store.Update(ctx, id, created.Revision, []byte(fmt.Sprintf("writer-%02d", writer)), storage.Rank{Ranked: true, Value: int64(writer)}, storage.Due{State: storage.DueAt, UnixMillis: int64(writer + 1)})
+			results <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	winners, conflicts := 0, 0
+	for err := range results {
+		if err == nil {
+			winners++
+			continue
+		}
+		var conflict *storage.OrderedRevisionConflictError
+		if errors.As(err, &conflict) && conflict.ExpectedRevision == 1 && conflict.ActualRevision == 2 {
+			conflicts++
+			continue
+		}
+		t.Errorf("concurrent Update = %T %v, want one success or revision 1/2 conflict", err, err)
+	}
+	if winners != 1 || conflicts != writers-1 {
+		t.Fatalf("concurrent Update winners/conflicts = %d/%d, want 1/%d", winners, conflicts, writers-1)
+	}
+	got, err := store.Get(ctx, id)
+	if err != nil || got.Revision != 2 {
+		t.Fatalf("record after concurrent Update = revision %d, err %v; want revision 2", got.Revision, err)
+	}
+}
+
+func TestConcurrentDeleteAdvancesRevisionExactlyOnce(t *testing.T) {
+	store, pool := newIntegrationStore(t)
+	ctx := boundedContext(t)
+	id := orderedID("contended-delete")
+	created, _, err := store.Create(ctx, id, "workers", []byte("before"), storage.Rank{Ranked: true, Value: 1}, storage.Due{State: storage.DueAt, UnixMillis: 1})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	installSlowUpdateTrigger(t, ctx, pool, store)
+
+	const writers = 16
+	start := make(chan struct{})
+	results := make(chan storage.OrderedRecord, writers)
+	errorsSeen := make(chan error, writers)
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			record, err := store.Delete(ctx, id, created.Revision)
+			results <- record
+			errorsSeen <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errorsSeen)
+	for err := range errorsSeen {
+		if err != nil {
+			t.Errorf("concurrent Delete: %v", err)
+		}
+	}
+	for record := range results {
+		if !record.Deleted || record.Revision != 2 {
+			t.Errorf("concurrent Delete returned deleted/revision %v/%d, want true/2", record.Deleted, record.Revision)
+		}
+	}
+	got, err := store.Get(ctx, id)
+	if err != nil || !got.Deleted || got.Revision != 2 {
+		t.Fatalf("record after concurrent Delete = deleted/revision %v/%d, err %v; want true/2", got.Deleted, got.Revision, err)
 	}
 }
 

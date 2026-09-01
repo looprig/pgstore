@@ -37,7 +37,9 @@
    concurrent same/distinct create, immutable order, atomic rank/due update, CAS,
    tombstone retry/nonreuse, cancellation, and namespace isolation.
 2. Implement validation and record scanning helpers.
-3. Implement serializable transactions with classified retries and per-scope counter.
+3. Implement explicit Read Committed transactions with a row-locked per-scope
+   counter and authoritative post-lock identity recheck. Keep classified
+   serialization/deadlock retries bounded for errors PostgreSQL actually returns.
 4. Implement exact-row Update/Delete CAS and revision exhaustion.
 5. Run each focused RED green, then the mutation-side conformance subset.
 
@@ -84,3 +86,14 @@
    diff/status checks.
 5. Self-review against every P1.4 requirement and commit repository-local files as
    `feat(pgstore): add ordered index` without pushing or tagging.
+
+## Isolation review correction
+
+The original plan used “serializable” where the runbook requires “transactional.”
+Post-implementation review reproduced the released 100-writer Create case under
+both modes. Read Committed passed 100/100 in five consecutive runs. A minimal
+Serializable substitution completed only 35/100 before the four classified retry
+attempts were exhausted, with PostgreSQL reporting SQLSTATE `40001` concurrent
+update failures. The final protocol therefore pins Read Committed and proves its
+load-bearing scope/row locks and post-lock recheck through named concurrency tests,
+source guards, and mutation kills.

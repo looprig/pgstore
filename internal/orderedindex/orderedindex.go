@@ -99,7 +99,7 @@ func (s *Store) Create(ctx context.Context, id storage.OrderedID, rankingScope s
 }
 
 func (s *Store) createOnce(ctx context.Context, id storage.OrderedID, rankingScope string, value []byte, rank storage.Rank, due storage.Due) (storage.OrderedRecord, bool, error) {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return storage.OrderedRecord{}, false, err
 	}
@@ -192,7 +192,7 @@ func (s *Store) Update(ctx context.Context, id storage.OrderedID, expectedRevisi
 }
 
 func (s *Store) updateOnce(ctx context.Context, id storage.OrderedID, expectedRevision uint64, value []byte, rank storage.Rank, due storage.Due) (storage.OrderedRecord, error) {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
@@ -200,7 +200,7 @@ func (s *Store) updateOnce(ctx context.Context, id storage.OrderedID, expectedRe
 	if err := pginternal.SetLocalTimeouts(ctx, tx, s.statementTimeout, s.lockTimeout); err != nil {
 		return storage.OrderedRecord{}, err
 	}
-	current, err := s.getFrom(ctx, tx, id, " FOR UPDATE")
+	current, err := s.getForUpdate(ctx, tx, id)
 	if err == pgx.ErrNoRows {
 		return storage.OrderedRecord{}, &storage.OrderedRecordNotFoundError{ID: id}
 	}
@@ -270,7 +270,7 @@ func (s *Store) Delete(ctx context.Context, id storage.OrderedID, expectedRevisi
 }
 
 func (s *Store) deleteOnce(ctx context.Context, id storage.OrderedID, expectedRevision uint64) (storage.OrderedRecord, error) {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
@@ -278,7 +278,7 @@ func (s *Store) deleteOnce(ctx context.Context, id storage.OrderedID, expectedRe
 	if err := pginternal.SetLocalTimeouts(ctx, tx, s.statementTimeout, s.lockTimeout); err != nil {
 		return storage.OrderedRecord{}, err
 	}
-	current, err := s.getFrom(ctx, tx, id, " FOR UPDATE")
+	current, err := s.getForUpdate(ctx, tx, id)
 	if err == pgx.ErrNoRows {
 		return storage.OrderedRecord{}, &storage.OrderedRecordNotFoundError{ID: id}
 	}
@@ -430,6 +430,10 @@ func (s *Store) get(ctx context.Context, id storage.OrderedID) (storage.OrderedR
 }
 func (s *Store) getFrom(ctx context.Context, queryer queryRower, id storage.OrderedID, suffix string) (storage.OrderedRecord, error) {
 	return scanRecord(queryer.QueryRow(ctx, "SELECT "+recordColumns+" FROM "+s.recordsTable()+" WHERE namespace = $1 AND ordering_scope = $2 AND stable_key = $3"+suffix, id.Namespace, id.OrderingScope, string(id.StableKey)))
+}
+
+func (s *Store) getForUpdate(ctx context.Context, tx pgx.Tx, id storage.OrderedID) (storage.OrderedRecord, error) {
+	return s.getFrom(ctx, tx, id, " FOR UPDATE")
 }
 
 func scanRecord(row rowScanner) (storage.OrderedRecord, error) {
