@@ -70,6 +70,11 @@ in-memory global sort.
 The three page statements and their ordered bound arguments are constructed by one
 internal package used by both production and the tagged EXPLAIN gate. The plan gate
 therefore executes the exact first/middle-page SQL rather than a hand-copied facsimile.
+Its unit guard parses both call sites with Go's AST: every production listing must pass
+one directly built statement's SQL and variadic arguments to `Query`, and the plan table
+must contain exactly the six direct first/middle builder calls. This structural check is
+insensitive to harmless formatting while copied SQL and unused or shadowed builder calls
+cannot satisfy statement ownership.
 ListOrdered qualifies the physical numeric `order_id` in its `ORDER BY`: the selected
 value is cast to text for lossless unsigned decoding, and an unqualified name would
 otherwise make PostgreSQL sort by that text output expression instead of walking the
