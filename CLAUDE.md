@@ -50,3 +50,6 @@ command uses `GOWORK=off`, and tests always run with `-race`.
 
 Run `make check` before each commit and `make test-integration` when a disposable
 PostgreSQL instance is available.
+
+Known deferred work, including which suites are and are not runnable through a
+transaction-mode PgBouncer today, is recorded in `docs/FOLLOWUPS.md`.
