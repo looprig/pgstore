@@ -11,6 +11,14 @@ apply mode serializes owners under an explicit transaction-scoped migration
 lock. Leaser and OrderedIndex remain typed `NotImplementedError` seams for
 P1.3 and P1.4.
 
+An operation whose acknowledgement is lost is resolved by an authoritative
+reread, never by a cached value. For `Ledger.Append` that reread reports success
+only for this caller's own payload at the expected sequence, a conflict for
+another writer's record there, and `storage.AmbiguousError` when the record is
+absent — absence cannot prove the append never committed, because a concurrent
+`Delete` cascades records away. `KV.Put` resolves an absent key to the original
+failure instead; `internal/kv/kv.go` records why that difference is deliberate.
+
 ## Configuration
 
 `Options` requires a PostgreSQL DSN using verified TLS. DSN values and parser
@@ -52,6 +60,11 @@ GOWORK=off go test ./...
 ```
 
 The integration-tagged Storage conformance wiring reads `PGSTORE_TEST_DSN` and
-skips when it is absent. Ledger/KV conformance, transaction races, migration
+skips when it is absent; each test provisions its own uniquely prefixed schema
+objects rather than sharing a fixture. `scripts/mutation-test.sh` runs the
+mutation campaign and needs the same DSN. Key ordering coverage depends on the
+database collation: `TestKVKeysUsesMemstoreBytewiseOrdering` skips on a
+bytewise-collating database, where `TestKVKeysPinsBytewiseCollation` is the
+guard that still holds. Ledger/KV conformance, transaction races, migration
 ownership, cancellation, and ambiguous-commit tests require a disposable
 PostgreSQL database.

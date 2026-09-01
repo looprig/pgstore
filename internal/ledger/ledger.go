@@ -117,9 +117,16 @@ func (s *Store) resolveAppend(ctx context.Context, name string, expected uint64,
 	if err == nil && bytes.Equal(stored, payload) {
 		return nil
 	}
+	// A row that is not this caller's payload belongs to another writer: a
+	// durable conflict, never this caller's success.
 	if err == nil {
 		return &storage.ConflictError{Name: name, Expected: expected}
 	}
+	// Absence is not proof that the append never committed, because a
+	// concurrent Delete cascades the record away. The tip is the expected
+	// sequence for every later append, so a caller wrongly told it did not
+	// append cannot recover; ambiguity is the only honest answer. See the note
+	// on kv.resolvePut for why KV resolves the same shape differently.
 	return &storage.AmbiguousError{Name: name, Expected: expected, Cause: cause}
 }
 

@@ -26,7 +26,6 @@ type Store struct {
 	KV           storage.KV
 	OrderedIndex storage.OrderedIndex
 
-	pool      *pgxpool.Pool
 	closeOnce sync.Once
 	closePool func()
 }
@@ -58,7 +57,6 @@ func Open(ctx context.Context, options Options) (*Store, error) {
 		Leaser:       lease.New(pool, resolved.schema, resolved.tablePrefix),
 		KV:           kv.New(pool, resolved.schema, resolved.tablePrefix),
 		OrderedIndex: orderedindex.New(pool, resolved.schema, resolved.tablePrefix),
-		pool:         pool,
 		closePool:    pool.Close,
 	}, nil
 }

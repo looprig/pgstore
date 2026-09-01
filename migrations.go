@@ -31,6 +31,14 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, schema, prefix string, mod
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
 	// The parameterized lock key serializes migration owners across processes.
+	//
+	// FORWARD CONSTRAINT (P1.3 step 2): the prohibition on advisory locks is
+	// scoped to lease and operation code, where correctness must survive each
+	// call landing on a different physical pool connection. This lock is
+	// exempt and must stay: it is transaction-scoped, taken and released
+	// inside one migration transaction on one connection, and it guards DDL,
+	// not a lease. A blanket ban expressed as a dependency or source test must
+	// carve this call site out rather than delete it.
 	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", schema); err != nil {
 		return migrationFailure(ctx)
 	}
@@ -66,6 +74,11 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, schema, prefix string, mod
 		if parseErr != nil || n <= version {
 			continue
 		}
+		// COVERAGE NOTE: with exactly one embedded migration this branch cannot
+		// be reached by any input — n is 1 and version is 0 whenever the loop
+		// body runs — so no test kills a mutation that disables it, and none
+		// pretends to. It becomes reachable, and must be covered, when P1.3 or
+		// P1.4 adds the second migration file.
 		if n != version+1 {
 			return errors.New("pgstore: embedded migrations are not monotonic")
 		}

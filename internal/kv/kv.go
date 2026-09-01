@@ -142,6 +142,24 @@ func (s *Store) table() string { return pginternal.Qualified(s.schema, s.tablePr
 
 // resolvePut uses a fresh bounded context because the caller's canceled context
 // cannot answer whether PostgreSQL committed before its acknowledgement was lost.
+//
+// An absent key resolves to the original cause — a definite-failure signal such
+// as context.Canceled — while an absent Ledger record resolves to
+// storage.AmbiguousError. This asymmetry is deliberate, and it is NOT derived
+// from the Ledger's stated reasoning: "a concurrent delete means absence cannot
+// prove the write never committed" is equally true here, since a committed Put
+// that is then deleted also rereads as absent. Reporting a definite failure for
+// that outcome is inaccurate, and it is kept anyway for a narrower reason.
+//
+// A KV revision is a private CAS token: a caller that retries reads the current
+// value and revision and converges, whatever really happened. A Ledger tip is
+// not private — it is the expected sequence every subsequent append and every
+// downstream reader is written against — so a caller told "definitely did not
+// append" that in fact did append is permanently desynchronized from the log.
+// The asymmetry therefore lands the pessimistic answer where a wrong answer is
+// unrecoverable and the simpler answer where a retry repairs it. Should KV
+// callers ever derive shared state from a revision, this must become ambiguous
+// too.
 func (s *Store) resolvePut(key string, expected uint64, value []byte, cause error) (uint64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), pginternal.AuthoritativeReadTimeout())
 	defer cancel()

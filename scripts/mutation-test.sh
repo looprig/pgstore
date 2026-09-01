@@ -2,7 +2,7 @@
 set -eu
 
 snapshot_dir="/private/tmp/pgstore-mutation-snapshot-${UID:-codex}"
-files="go.mod options.go pgstore.go migrations.go internal/guard/guard.go internal/postgres/postgres.go internal/ledger/ledger.go internal/lease/lease.go internal/kv/kv.go internal/orderedindex/orderedindex.go"
+files="go.mod options.go pgstore.go migrations.go internal/guard/guard.go internal/postgres/postgres.go internal/ledger/ledger.go internal/lease/lease.go internal/kv/kv.go internal/orderedindex/orderedindex.go conformance_integration_test.go"
 
 restore_snapshot() {
 	for snapshot_file in $files; do
@@ -165,6 +165,46 @@ run_integration_mutation "kv absent outcome" internal/kv/kv.go 'if err == pgx.Er
 run_integration_mutation "kv CAS revision predicate" internal/kv/kv.go ' WHERE key = $1 AND revision = $2 RETURNING revision' ' WHERE key = $1 RETURNING revision' TestConcurrentKVCASHasExactlyOneWinnerPerRevision 'want exactly 1'
 run_integration_mutation "kv prefix parameterization" internal/kv/kv.go '"SELECT key FROM "+s.table()+" WHERE left(key, length($1)) = $1 ORDER BY key COLLATE \"C\"", prefix' '"SELECT key FROM "+s.table()+" WHERE left(key, length('"'"'"+prefix+"'"'"')) = '"'"'"+prefix+"'"'"' ORDER BY key COLLATE \"C\""' TestKVKeysPrefixIsDataNotSQL 'Keys with SQL-shaped prefix:'
 run_mutation "kv bytewise collation" internal/kv/kv.go 'ORDER BY key COLLATE \"C\"' 'ORDER BY key' TestKVKeysPinsBytewiseCollation 'does not pin ORDER BY'
+
+# Seam invariant: an unimplemented operation may never return a nil or zero
+# value without an error. The guard derives the unimplemented set, so the
+# derivation is mutated here too, not just the operations.
+run_mutation "Leaser.Acquire returns nil, nil" internal/lease/lease.go 'return nil, guard.NotImplemented("Leaser.Acquire")' 'return nil, nil' TestSeamOperationsReturnNotImplemented 'does not call guard.NotImplemented'
+run_mutation "OrderedIndex.Create returns zero, true, nil" internal/orderedindex/orderedindex.go 'return storage.OrderedRecord{}, false, guard.NotImplemented("OrderedIndex.Create")' 'return storage.OrderedRecord{}, true, nil' TestSeamOperationsReturnNotImplemented 'does not call guard.NotImplemented'
+run_mutation "OrderedIndex.Delete returns zero, nil" internal/orderedindex/orderedindex.go 'return storage.OrderedRecord{}, guard.NotImplemented("OrderedIndex.Delete")' 'return storage.OrderedRecord{}, nil' TestSeamOperationsReturnNotImplemented 'does not call guard.NotImplemented'
+run_mutation "implemented KV.Get claims NotImplemented" internal/kv/kv.go 'return nil, 0, &storage.KeyNotFoundError{Key: key}' 'return nil, 0, guard.NotImplemented("KV.Get")' TestSeamOperationsReturnNotImplemented 'calls guard.NotImplemented although KV conformance runs'
+run_mutation "unskipped conformance without implementation" conformance_integration_test.go 't.Skip("P1.3 implements PostgreSQL leases")' '_ = 0' TestSeamOperationsReturnNotImplemented 'calls guard.NotImplemented although Leaser conformance runs'
+run_mutation "conformance entry point removed" conformance_integration_test.go 'func TestLeaserConformance' 'func LeaserConformanceRemoved' TestSeamOperationsReturnNotImplemented 'has no TestLeaserConformance entry point'
+
+# Identifier budget: PostgreSQL truncates past 63 bytes silently.
+run_mutation "oversized table suffix" internal/orderedindex/orderedindex.go 'var _ storage.OrderedIndex = (*Store)(nil)' 'var dueTable = func(tablePrefix string) string { return tablePrefix + "ordered_index_due_state_page" }
+
+var _ storage.OrderedIndex = (*Store)(nil)' TestTableSuffixesFitTheReservedIdentifierBudget 'over the 23-byte reserve'
+
+# Both halves of the Ledger append authoritative reread.
+run_integration_mutation "absent record reported as success" internal/ledger/ledger.go 'return &storage.AmbiguousError{Name: name, Expected: expected, Cause: cause}' 'return nil' TestAppendReportsAmbiguousWhenTheRecordIsAbsentAfterAnUnknownCommit 'want *storage.AmbiguousError'
+run_integration_mutation "another writer's record claimed as success" internal/ledger/ledger.go 'if err == nil && bytes.Equal(stored, payload) {' 'if err == nil {' TestAppendReportsConflictWhenAnotherWriterOwnsTheSequence 'want *storage.ConflictError'
+
+# The retry classifier reached by an error PostgreSQL really raises, not an
+# injected *pgconn.PgError.
+run_integration_mutation "real serialization SQLSTATE classification" internal/postgres/postgres.go 'pgErr.Code == "40001"' 'pgErr.Code == "40002"' TestAppendRetriesARealSerializationFailureFromPostgreSQL 'want *storage.ConflictError from the retried attempt'
+
+# Migration version policy.
+run_integration_mutation "schema downgrade guard" migrations.go 'if version > currentSchemaVersion {' 'if false && version > currentSchemaVersion {' TestMigrationRefusesASchemaNewerThanThisBuild 'want the downgrade guard'
+run_integration_mutation "validate accepts any version" migrations.go 'if version != currentSchemaVersion {' 'if false && version != currentSchemaVersion {' TestMigrationValidateDoesNotCreateAbsentSchema 'Open validate returned store for absent schema'
+run_integration_mutation "already-applied migration replayed" migrations.go 'if parseErr != nil || n <= version {' 'if parseErr != nil || n < version {' TestMigrationIsIdempotentAndValidatesACurrentSchema 'second Open with MigrationApply on a current schema'
+
+# Redaction, on every error path the implemented primitives construct rather
+# than one representative path. Each mutation interpolates the live DSN.
+run_integration_mutation "ledger append leaks DSN" internal/ledger/ledger.go 'return pginternal.RedactedError("ledger append")' "return errors.New(\"ledger append failed: ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'Ledger.Append error disclosed'
+run_integration_mutation "ledger read leaks DSN" internal/ledger/ledger.go 'return nil, operationFailure(ctx, "ledger read")' "return nil, errors.New(\"ledger read failed: ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'Ledger.Read error disclosed'
+run_integration_mutation "ledger tip leaks DSN" internal/ledger/ledger.go 'return 0, operationFailure(ctx, "ledger tip")' "return 0, errors.New(\"ledger tip failed: ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'Ledger.Tip error disclosed'
+run_integration_mutation "ledger delete resolution leaks DSN" internal/ledger/ledger.go 'return pginternal.RedactedError("ledger delete outcome resolution")' "return errors.New(\"ledger delete outcome resolution failed: ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'Ledger.Delete error disclosed'
+run_integration_mutation "kv get leaks DSN" internal/kv/kv.go 'return nil, 0, failure(ctx, "kv get")' "return nil, 0, pginternal.RedactedError(\"kv get on ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Get error disclosed'
+run_integration_mutation "kv keys leaks DSN" internal/kv/kv.go 'return nil, failure(ctx, "kv keys")' "return nil, pginternal.RedactedError(\"kv keys on ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Keys error disclosed'
+run_integration_mutation "kv put resolution leaks DSN" internal/kv/kv.go 'return 0, pginternal.RedactedError("kv put outcome resolution")' "return 0, pginternal.RedactedError(\"kv put outcome resolution on ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Put error disclosed'
+run_integration_mutation "kv delete resolution leaks DSN" internal/kv/kv.go 'return pginternal.RedactedError("kv delete outcome resolution")' "return pginternal.RedactedError(\"kv delete outcome resolution on ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Delete error disclosed'
+run_integration_mutation "migration failure leaks DSN" migrations.go 'return pginternal.RedactedError("schema migration")' "return errors.New(\"schema migration failed: ${PGSTORE_TEST_DSN}\")" TestMigrationErrorsDoNotDiscloseDSNOrCredential 'error disclosed'
 
 restore_snapshot
 rm -rf "$snapshot_dir"

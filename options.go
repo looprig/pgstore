@@ -16,7 +16,16 @@ const (
 	defaultStatementTimeout    time.Duration = 30 * time.Second
 	defaultLockTimeout         time.Duration = 5 * time.Second
 	maxPostgresIdentifierBytes               = 63
-	maxTablePrefixBytes                      = 40
+	// maxTableSuffixBytes reserves identifier budget for the longest suffix a
+	// primitive may append to TablePrefix ("schema_migrations" is 17 today).
+	// PostgreSQL truncates an identifier past 63 bytes silently rather than
+	// failing, so an over-long prefix would not error: it would map two
+	// distinct tables onto one name. A primitive added by P1.3 or P1.4 whose
+	// suffix exceeds this reserve must raise it, which lowers the accepted
+	// TablePrefix length. TestTableSuffixesFitTheReservedIdentifierBudget
+	// derives the actual suffixes from production source and enforces this.
+	maxTableSuffixBytes = 23
+	maxTablePrefixBytes = maxPostgresIdentifierBytes - maxTableSuffixBytes
 )
 
 // MigrationMode controls what Open may do with embedded schema migrations.
@@ -113,7 +122,7 @@ func (o Options) resolve() (resolvedOptions, error) {
 		tablePrefix = defaultTablePrefix
 	}
 	if !validIdentifier(tablePrefix, maxTablePrefixBytes) {
-		return resolvedOptions{}, invalidOption("TablePrefix", "must be a lowercase identifier prefix of at most 40 bytes")
+		return resolvedOptions{}, invalidOption("TablePrefix", "must be a lowercase identifier prefix of at most "+strconv.Itoa(maxTablePrefixBytes)+" bytes, leaving room for the longest table suffix within PostgreSQL's 63-byte identifier limit")
 	}
 
 	statementTimeout, err := resolveTimeout("StatementTimeout", o.StatementTimeout, defaultStatementTimeout)
@@ -133,6 +142,14 @@ func (o Options) resolve() (resolvedOptions, error) {
 
 	poolConfig.MinConns = o.MinConns
 	poolConfig.MaxConns = maxConns
+	// FORWARD CONSTRAINT (P1.3 step 1, P1.5 step 2): these are startup
+	// RuntimeParams, sent in the connection handshake, and pgx's default exec
+	// mode caches prepared statements per connection. Both are incompatible
+	// with PgBouncer in transaction pooling mode, which the lease topology and
+	// the released deployment documentation are required to support. Whoever
+	// takes that requirement must move these to per-transaction SET LOCAL (or
+	// an AfterConnect hook) and select a non-caching QueryExecMode; do not
+	// simply document the limitation away.
 	poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = strconv.FormatInt(statementTimeout.Milliseconds(), 10)
 	poolConfig.ConnConfig.RuntimeParams["lock_timeout"] = strconv.FormatInt(lockTimeout.Milliseconds(), 10)
 
