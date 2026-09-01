@@ -7,10 +7,22 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+// advisoryLockFlavour matches the whole PostgreSQL advisory-lock function name,
+// not the family prefix. Counting occurrences of "pg_advisory" pins how many
+// advisory locks production takes but says nothing about their scope, and
+// pg_advisory_lock is session-scoped: under a transaction-mode pooler it is
+// acquired on one physical connection and never released on it. That mutation
+// survives every database-free test and is otherwise caught only by a five
+// second block, which is a kill by hanging rather than by an assertion.
+var advisoryLockFlavour = regexp.MustCompile(`pg_advisory[a-z0-9_]*`)
+
+const wantAdvisoryLockFlavour = "pg_advisory_xact_lock"
 
 func TestProductionAdvisoryLockOccurrencesAreExactlyTheMigrationLock(t *testing.T) {
 	t.Parallel()
@@ -33,7 +45,12 @@ func TestProductionAdvisoryLockOccurrencesAreExactlyTheMigrationLock(t *testing.
 				t.Errorf("unquote string in %s: %v", path, err)
 				return true
 			}
-			got[path] += strings.Count(strings.ToLower(value), "pg_advisory")
+			for _, flavour := range advisoryLockFlavour.FindAllString(strings.ToLower(value), -1) {
+				got[path]++
+				if flavour != wantAdvisoryLockFlavour {
+					t.Errorf("%s takes advisory lock %s, want the transaction-scoped %s: a session-scoped lock is not released by the migration transaction and leaks across a PgBouncer connection", path, flavour, wantAdvisoryLockFlavour)
+				}
+			}
 			return true
 		})
 	}

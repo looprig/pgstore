@@ -78,6 +78,16 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, schema, prefix string, mod
 		if parseErr != nil || n <= version {
 			continue
 		}
+		// COVERAGE NOTE: still unreachable by any input, and still uncovered.
+		// The embedded set is 0001, 0002, 0003 — consecutive — and the loop
+		// body runs only for n > version, so n is always version+1. The
+		// versions this branch could see are bounded above by the
+		// currentSchemaVersion check earlier in this function, so no database
+		// state reaches it either. P1.3 and P1.4 each added a migration and
+		// neither made it reachable; only a gap or a duplicate in the embedded
+		// numbering would, and the numbering is not caller input. The branch
+		// is deliberately kept as a guard against a future numbering mistake.
+		// No test kills a mutation that disables it, and none pretends to.
 		if n != version+1 {
 			return errors.New("pgstore: embedded migrations are not monotonic")
 		}
