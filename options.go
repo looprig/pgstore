@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -15,6 +16,8 @@ const (
 	defaultTablePrefix                       = "looprig_"
 	defaultStatementTimeout    time.Duration = 30 * time.Second
 	defaultLockTimeout         time.Duration = 5 * time.Second
+	defaultLeaseTTL            time.Duration = 15 * time.Second
+	defaultLeaseRenewInterval  time.Duration = 5 * time.Second
 	maxPostgresIdentifierBytes               = 63
 	// maxTableSuffixBytes reserves identifier budget for the longest suffix a
 	// primitive may append to TablePrefix ("schema_migrations" is 17 today).
@@ -52,8 +55,10 @@ type Options struct {
 	Schema      string
 	TablePrefix string
 
-	StatementTimeout time.Duration
-	LockTimeout      time.Duration
+	StatementTimeout   time.Duration
+	LockTimeout        time.Duration
+	LeaseTTL           time.Duration
+	LeaseRenewInterval time.Duration
 
 	Migrations MigrationMode
 
@@ -74,14 +79,16 @@ func (e *OptionsError) Error() string {
 }
 
 type resolvedOptions struct {
-	poolConfig       *pgxpool.Config
-	minConns         int32
-	maxConns         int32
-	schema           string
-	tablePrefix      string
-	statementTimeout time.Duration
-	lockTimeout      time.Duration
-	migrations       MigrationMode
+	poolConfig         *pgxpool.Config
+	minConns           int32
+	maxConns           int32
+	schema             string
+	tablePrefix        string
+	statementTimeout   time.Duration
+	lockTimeout        time.Duration
+	leaseTTL           time.Duration
+	leaseRenewInterval time.Duration
+	migrations         MigrationMode
 }
 
 func (o Options) resolve() (resolvedOptions, error) {
@@ -136,27 +143,37 @@ func (o Options) resolve() (resolvedOptions, error) {
 	if lockTimeout > statementTimeout {
 		return resolvedOptions{}, invalidOption("LockTimeout", "must not exceed StatementTimeout")
 	}
+	leaseTTL, err := resolveTimeout("LeaseTTL", o.LeaseTTL, defaultLeaseTTL)
+	if err != nil {
+		return resolvedOptions{}, err
+	}
+	leaseRenewInterval, err := resolveTimeout("LeaseRenewInterval", o.LeaseRenewInterval, defaultLeaseRenewInterval)
+	if err != nil {
+		return resolvedOptions{}, err
+	}
+	if leaseRenewInterval >= leaseTTL {
+		return resolvedOptions{}, invalidOption("LeaseRenewInterval", "must be shorter than LeaseTTL")
+	}
 	if o.Migrations > MigrationDisabled {
 		return resolvedOptions{}, invalidOption("Migrations", "has an unknown mode")
 	}
 
 	poolConfig.MinConns = o.MinConns
 	poolConfig.MaxConns = maxConns
-	// FORWARD CONSTRAINT (P1.3 step 1, P1.5 step 2): these are startup
-	// RuntimeParams, sent in the connection handshake, and pgx's default exec
-	// mode caches prepared statements per connection. Both are incompatible
-	// with PgBouncer in transaction pooling mode, which the lease topology and
-	// the released deployment documentation are required to support. Whoever
-	// takes that requirement must move these to per-transaction SET LOCAL (or
-	// an AfterConnect hook) and select a non-caching QueryExecMode; do not
-	// simply document the limitation away.
-	poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = strconv.FormatInt(statementTimeout.Milliseconds(), 10)
-	poolConfig.ConnConfig.RuntimeParams["lock_timeout"] = strconv.FormatInt(lockTimeout.Milliseconds(), 10)
+	// Transaction-pooling proxies do not preserve server sessions between
+	// operations. Do not install session startup parameters or use pgx's
+	// connection-local prepared-statement cache. Transactions that take locks
+	// apply the configured limits with SET LOCAL through parameterized
+	// set_config calls.
+	delete(poolConfig.ConnConfig.RuntimeParams, "statement_timeout")
+	delete(poolConfig.ConnConfig.RuntimeParams, "lock_timeout")
+	poolConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec
 
 	return resolvedOptions{
 		poolConfig: poolConfig, minConns: o.MinConns, maxConns: maxConns,
 		schema: schema, tablePrefix: tablePrefix,
 		statementTimeout: statementTimeout, lockTimeout: lockTimeout,
+		leaseTTL: leaseTTL, leaseRenewInterval: leaseRenewInterval,
 		migrations: o.Migrations,
 	}, nil
 }

@@ -2,11 +2,14 @@
 package postgres
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -31,6 +34,14 @@ func Retryable(err error) bool {
 func Attempts() int { return maxTransactionAttempts }
 
 func AuthoritativeReadTimeout() time.Duration { return 5 * time.Second }
+
+// SetLocalTimeouts applies transaction-scoped limits without relying on a
+// retained PostgreSQL session, so callers remain compatible with transaction
+// pooling proxies.
+func SetLocalTimeouts(ctx context.Context, tx pgx.Tx, statementTimeout, lockTimeout time.Duration) error {
+	_, err := tx.Exec(ctx, "SELECT set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, true)", strconv.FormatInt(statementTimeout.Milliseconds(), 10), strconv.FormatInt(lockTimeout.Milliseconds(), 10))
+	return err
+}
 
 // RedactedError deliberately retains neither driver text nor connection data.
 func RedactedError(operation string) error {

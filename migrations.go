@@ -9,18 +9,19 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	pginternal "github.com/looprig/pgstore/internal/postgres"
 )
 
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-func migrate(ctx context.Context, pool *pgxpool.Pool, schema, prefix string, mode MigrationMode) error {
+func migrate(ctx context.Context, pool *pgxpool.Pool, schema, prefix string, mode MigrationMode, statementTimeout, lockTimeout time.Duration) error {
 	if mode == MigrationDisabled {
 		return nil
 	}
@@ -29,6 +30,9 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, schema, prefix string, mod
 		return migrationFailure(ctx)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := pginternal.SetLocalTimeouts(ctx, tx, statementTimeout, lockTimeout); err != nil {
+		return migrationFailure(ctx)
+	}
 
 	// The parameterized lock key serializes migration owners across processes.
 	//
@@ -91,6 +95,7 @@ func migrate(ctx context.Context, pool *pgxpool.Pool, schema, prefix string, mod
 			"{{ledger_scopes}}":  pginternal.QuoteIdentifier(prefix + "ledger_scopes"),
 			"{{ledger_records}}": pginternal.QuoteIdentifier(prefix + "ledger_records"),
 			"{{kv}}":             pginternal.QuoteIdentifier(prefix + "kv"),
+			"{{leases}}":         pginternal.QuoteIdentifier(prefix + "leases"),
 		}
 		statement := string(sqlBytes)
 		for token, identifier := range replacements {

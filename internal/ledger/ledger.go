@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -15,16 +16,22 @@ import (
 )
 
 type Store struct {
-	pool        *pgxpool.Pool
-	schema      string
-	tablePrefix string
-	commit      func(context.Context, pgx.Tx) error
-	attempt     func(context.Context, string, uint64, []byte) error
-	delete      func(context.Context, string) error
+	pool             *pgxpool.Pool
+	schema           string
+	tablePrefix      string
+	commit           func(context.Context, pgx.Tx) error
+	attempt          func(context.Context, string, uint64, []byte) error
+	delete           func(context.Context, string) error
+	statementTimeout time.Duration
+	lockTimeout      time.Duration
 }
 
-func New(pool *pgxpool.Pool, schema, tablePrefix string) *Store {
-	store := &Store{pool: pool, schema: schema, tablePrefix: tablePrefix, commit: func(ctx context.Context, tx pgx.Tx) error { return tx.Commit(ctx) }}
+func New(pool *pgxpool.Pool, schema, tablePrefix string, operationTimeouts ...time.Duration) *Store {
+	statementTimeout, lockTimeout := 30*time.Second, 5*time.Second
+	if len(operationTimeouts) == 2 {
+		statementTimeout, lockTimeout = operationTimeouts[0], operationTimeouts[1]
+	}
+	store := &Store{pool: pool, schema: schema, tablePrefix: tablePrefix, statementTimeout: statementTimeout, lockTimeout: lockTimeout, commit: func(ctx context.Context, tx pgx.Tx) error { return tx.Commit(ctx) }}
 	store.attempt = store.appendOnce
 	store.delete = store.deleteOnce
 	return store
@@ -74,6 +81,9 @@ func (s *Store) appendOnce(ctx context.Context, name string, expected uint64, pa
 		return err
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := pginternal.SetLocalTimeouts(ctx, tx, s.statementTimeout, s.lockTimeout); err != nil {
+		return err
+	}
 	scopes := pginternal.Qualified(s.schema, s.tablePrefix+"ledger_scopes")
 	records := pginternal.Qualified(s.schema, s.tablePrefix+"ledger_records")
 	if _, err = tx.Exec(ctx, "INSERT INTO "+scopes+" (name, tip) VALUES ($1, 0) ON CONFLICT (name) DO NOTHING", name); err != nil {

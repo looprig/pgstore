@@ -9,3 +9,9 @@ The runner records monotonic versions in a prefix-scoped migration table and
 serializes owners with a transaction-scoped PostgreSQL advisory lock before it
 creates the schema or version table. Later lease and ordered-index work adds
 new numbered migrations; it does not rewrite `0001` after release.
+
+`0002_leases.sql` adds the persistent transactional epoch-lease table. A row
+survives release and expiry so its greatest epoch can never reset. The nullable
+holder and expiry columns are cleared together only by a matching release;
+expired holders remain available for the next transactional acquisition to
+replace while advancing the epoch and revision.

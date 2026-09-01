@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func TestMigrationAppliesVersionOneFromEmptySchema(t *testing.T) {
+func TestMigrationAppliesCurrentVersionFromEmptySchema(t *testing.T) {
 	dsn := os.Getenv("PGSTORE_TEST_DSN")
 	if dsn == "" {
 		t.Skip("PGSTORE_TEST_DSN is not set")
@@ -25,6 +25,118 @@ func TestMigrationAppliesVersionOneFromEmptySchema(t *testing.T) {
 		t.Fatalf("Open with migration apply: %v", err)
 	}
 	store.Close()
+}
+
+func TestMigrationAddsLeaseTable(t *testing.T) {
+	admin := adminPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := admin.Exec(ctx, "DROP SCHEMA IF EXISTS migrationlease CASCADE"); err != nil {
+		t.Fatalf("drop schema: %v", err)
+	}
+	store, err := Open(ctx, Options{DSN: os.Getenv("PGSTORE_TEST_DSN"), Schema: "migrationlease", TablePrefix: "fresh_", Migrations: MigrationApply, AllowInsecureLocalhostOnly: true})
+	if err != nil {
+		t.Fatalf("Open with migration apply: %v", err)
+	}
+	store.Close()
+
+	want := []string{"epoch", "expires_at", "holder", "name", "revision"}
+	rows, err := admin.Query(ctx, `SELECT column_name FROM information_schema.columns WHERE table_schema = 'migrationlease' AND table_name = 'fresh_leases' ORDER BY column_name`)
+	if err != nil {
+		t.Fatalf("query lease columns: %v", err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			t.Fatalf("scan lease column: %v", err)
+		}
+		got = append(got, column)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate lease columns: %v", err)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("lease columns = %v, want %v", got, want)
+	}
+	wantConstraints := map[string]bool{
+		"PRIMARY KEY (name)":                                true,
+		"CHECK ((epoch >= 0))":                              true,
+		"CHECK ((revision >= 0))":                           true,
+		"CHECK (((holder IS NULL) = (expires_at IS NULL)))": true,
+	}
+	constraintRows, err := admin.Query(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'migrationlease.fresh_leases'::regclass`)
+	if err != nil {
+		t.Fatalf("query lease constraints: %v", err)
+	}
+	defer constraintRows.Close()
+	gotConstraints := make(map[string]bool)
+	for constraintRows.Next() {
+		var definition string
+		if err := constraintRows.Scan(&definition); err != nil {
+			t.Fatalf("scan lease constraint: %v", err)
+		}
+		gotConstraints[definition] = true
+	}
+	if err := constraintRows.Err(); err != nil {
+		t.Fatalf("iterate lease constraints: %v", err)
+	}
+	if len(gotConstraints) != len(wantConstraints) {
+		t.Fatalf("lease constraints = %v, want exactly %v", gotConstraints, wantConstraints)
+	}
+	for definition := range wantConstraints {
+		if !gotConstraints[definition] {
+			t.Fatalf("lease constraints = %v, missing %q", gotConstraints, definition)
+		}
+	}
+	var versions int
+	if err := admin.QueryRow(ctx, "SELECT count(*) FROM migrationlease.fresh_schema_migrations").Scan(&versions); err != nil {
+		t.Fatalf("count migration versions: %v", err)
+	}
+	if versions != 2 {
+		t.Fatalf("migration version rows = %d, want 2", versions)
+	}
+}
+
+func TestMigrationUpgradesVersionOneWithoutDataLoss(t *testing.T) {
+	admin := adminPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := admin.Exec(ctx, `DROP SCHEMA IF EXISTS migrationupgrade CASCADE;
+CREATE SCHEMA migrationupgrade;
+CREATE TABLE migrationupgrade.old_schema_migrations (version bigint PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
+INSERT INTO migrationupgrade.old_schema_migrations (version) VALUES (1);
+CREATE TABLE migrationupgrade.old_ledger_scopes (name text PRIMARY KEY, tip bigint NOT NULL CHECK (tip >= 0));
+CREATE TABLE migrationupgrade.old_ledger_records (name text NOT NULL REFERENCES migrationupgrade.old_ledger_scopes(name) ON DELETE CASCADE, seq bigint NOT NULL CHECK (seq > 0), payload bytea NOT NULL, PRIMARY KEY (name, seq));
+CREATE TABLE migrationupgrade.old_kv (key text PRIMARY KEY, revision bigint NOT NULL CHECK (revision > 0), value bytea NOT NULL);
+INSERT INTO migrationupgrade.old_kv (key, revision, value) VALUES ('sessions/kept', 7, decode('76616c7565', 'hex'));`); err != nil {
+		t.Fatalf("seed version one schema: %v", err)
+	}
+
+	store, err := Open(ctx, Options{DSN: os.Getenv("PGSTORE_TEST_DSN"), Schema: "migrationupgrade", TablePrefix: "old_", Migrations: MigrationApply, AllowInsecureLocalhostOnly: true})
+	if err != nil {
+		t.Fatalf("Open version one schema: %v", err)
+	}
+	defer store.Close()
+	value, revision, err := store.KV.Get(ctx, "sessions/kept")
+	if err != nil || string(value) != "value" || revision != 7 {
+		t.Fatalf("preserved KV = (%q, %d, %v), want (value, 7, nil)", value, revision, err)
+	}
+	var leaseTable bool
+	if err := admin.QueryRow(ctx, `SELECT to_regclass('migrationupgrade.old_leases') IS NOT NULL`).Scan(&leaseTable); err != nil {
+		t.Fatalf("find lease table: %v", err)
+	}
+	if !leaseTable {
+		t.Fatal("version one upgrade did not create lease table")
+	}
+	var versions int
+	if err := admin.QueryRow(ctx, "SELECT count(*) FROM migrationupgrade.old_schema_migrations").Scan(&versions); err != nil {
+		t.Fatalf("count migration versions: %v", err)
+	}
+	if versions != 2 {
+		t.Fatalf("migration version rows = %d, want 2", versions)
+	}
 }
 
 func TestConcurrentMigrationOwnersSerializeFromVersionZero(t *testing.T) {
@@ -76,8 +188,8 @@ func TestConcurrentMigrationOwnersSerializeFromVersionZero(t *testing.T) {
 		if err := admin.QueryRow(ctx, "SELECT count(*) FROM migrationrace."+table).Scan(&versions); err != nil {
 			t.Fatalf("read %s: %v", table, err)
 		}
-		if versions != 1 {
-			t.Fatalf("%s version rows = %d, want 1", table, versions)
+		if versions != 2 {
+			t.Fatalf("%s version rows = %d, want 2", table, versions)
 		}
 	}
 }
@@ -124,7 +236,7 @@ func TestMigrationRefusesASchemaNewerThanThisBuild(t *testing.T) {
 	if _, err := admin.Exec(ctx, `DROP SCHEMA IF EXISTS downgrade CASCADE;
 CREATE SCHEMA downgrade;
 CREATE TABLE downgrade.future_schema_migrations (version bigint PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
-INSERT INTO downgrade.future_schema_migrations (version) VALUES (2);`); err != nil {
+INSERT INTO downgrade.future_schema_migrations (version) VALUES (3);`); err != nil {
 		t.Fatalf("seed future schema: %v", err)
 	}
 	for name, mode := range map[string]MigrationMode{"apply": MigrationApply, "validate": MigrationValidate} {
@@ -182,8 +294,8 @@ func TestMigrationIsIdempotentAndValidatesACurrentSchema(t *testing.T) {
 	if err := admin.QueryRow(ctx, "SELECT count(*) FROM reopen.again_schema_migrations").Scan(&versions); err != nil {
 		t.Fatalf("count versions: %v", err)
 	}
-	if versions != 1 {
-		t.Fatalf("version rows after two applies = %d, want 1", versions)
+	if versions != 2 {
+		t.Fatalf("version rows after two applies = %d, want 2", versions)
 	}
 
 	options.Migrations = MigrationValidate

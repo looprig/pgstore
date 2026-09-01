@@ -12,6 +12,81 @@ import (
 	"testing"
 )
 
+func TestProductionAdvisoryLockOccurrencesAreExactlyTheMigrationLock(t *testing.T) {
+	t.Parallel()
+	want := map[string]int{"migrations.go": 1}
+	got := make(map[string]int)
+	inspected := 0
+	for _, path := range productionGoFiles(t) {
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			literal, ok := node.(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				return true
+			}
+			inspected++
+			value, err := strconv.Unquote(literal.Value)
+			if err != nil {
+				t.Errorf("unquote string in %s: %v", path, err)
+				return true
+			}
+			got[path] += strings.Count(strings.ToLower(value), "pg_advisory")
+			return true
+		})
+	}
+	if inspected == 0 {
+		t.Fatal("no production string literals inspected")
+	}
+	for path, count := range got {
+		if count == 0 {
+			delete(got, path)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("advisory-lock source set = %v, want exactly %v", got, want)
+	}
+	for path, wantCount := range want {
+		if got[path] != wantCount {
+			t.Fatalf("advisory-lock occurrences in %s = %d, want exactly %d", path, got[path], wantCount)
+		}
+	}
+}
+
+func TestLeaseAcquireUsesExactlyOneExplicitRowLock(t *testing.T) {
+	t.Parallel()
+	source, err := os.ReadFile("internal/lease/lease.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const required = "SELECT epoch, holder, expires_at, clock_timestamp() FROM "
+	if !strings.Contains(string(source), required) {
+		t.Fatal("lease acquire row-read query is absent; explicit-lock guard has no source input")
+	}
+	if count := strings.Count(string(source), " FOR UPDATE"); count != 1 {
+		t.Fatalf("lease operation FOR UPDATE occurrences = %d, want exactly 1", count)
+	}
+}
+
+func TestLeaseStoreDoesNotRetainPhysicalPoolConnections(t *testing.T) {
+	t.Parallel()
+	source, err := os.ReadFile("internal/lease/lease.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	if !strings.Contains(text, "s.pool.BeginTx(") || !strings.Contains(text, "s.pool.QueryRow(") {
+		t.Fatal("lease store has no transaction/query pool operations; retention guard has no source input")
+	}
+	for _, forbidden := range []string{"s.pool.Acquire(", "*pgxpool.Conn"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("lease store contains retained physical-connection form %q", forbidden)
+		}
+	}
+}
+
 // TestKVKeysPinsBytewiseCollation is a source guard that overlaps, but is not
 // subsumed by, the behavioural TestKVKeysUsesMemstoreBytewiseOrdering. Removing
 // COLLATE "C" genuinely fails the behavioural test on a database whose

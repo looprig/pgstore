@@ -51,9 +51,67 @@ func TestKVConformance(t *testing.T) {
 }
 
 func TestLeaserConformance(t *testing.T) {
-	t.Skip("P1.3 implements PostgreSQL leases")
 	storetest.TestLeaser(t, func(t *testing.T) storage.Leaser {
 		return newConformanceStore(t).Leaser
+	})
+}
+
+func TestLeaserLifecycleConformance(t *testing.T) {
+	storetest.TestLeaserLifecycle(t, func(t *testing.T) storetest.LeaserLifecycleHarness {
+		dsn := os.Getenv("PGSTORE_TEST_DSN")
+		if dsn == "" {
+			t.Skip("PGSTORE_TEST_DSN is not set")
+		}
+		const ttl = 500 * time.Millisecond
+		const renewInterval = 100 * time.Millisecond
+		prefix := fmt.Sprintf("lifecycle%x_%x_", time.Now().UnixNano(), conformanceStoreID.Add(1))
+		open := func(t *testing.T, mode MigrationMode) *Store {
+			t.Helper()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			store, err := Open(ctx, Options{
+				DSN: dsn, TablePrefix: prefix, Migrations: mode,
+				LeaseTTL: ttl, LeaseRenewInterval: renewInterval,
+				AllowInsecureLocalhostOnly: true,
+			})
+			if err != nil {
+				t.Fatalf("Open lifecycle store: %v", err)
+			}
+			t.Cleanup(store.Close)
+			return store
+		}
+		primary := open(t, MigrationApply)
+		admin := adminPool(t)
+		table := `"looprig"."` + prefix + `leases"`
+		var viewID atomic.Uint64
+		return storetest.LeaserLifecycleHarness{
+			Primary:       primary.Leaser,
+			PrimaryViewID: viewID.Add(1),
+			OpenIndependent: func(t *testing.T) storetest.LeaserLifecycleClient {
+				return storetest.LeaserLifecycleClient{Leaser: open(t, MigrationValidate).Leaser, ViewID: viewID.Add(1)}
+			},
+			Renew: func(t *testing.T, lease storage.Lease) {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				command, err := admin.Exec(ctx, "UPDATE "+table+" SET expires_at = clock_timestamp() + $2::bigint * interval '1 millisecond', revision = revision + 1 WHERE epoch = $1 AND expires_at > clock_timestamp()", int64(lease.Epoch()), ttl.Milliseconds())
+				if err != nil || command.RowsAffected() != 1 {
+					t.Fatalf("deterministic Renew = rows %d, %v", command.RowsAffected(), err)
+				}
+			},
+			Expire: func(t *testing.T, lease storage.Lease) {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				command, err := admin.Exec(ctx, "UPDATE "+table+" SET expires_at = clock_timestamp() WHERE epoch = $1", int64(lease.Epoch()))
+				if err != nil || command.RowsAffected() != 1 {
+					t.Fatalf("deterministic Expire = rows %d, %v", command.RowsAffected(), err)
+				}
+				select {
+				case <-lease.Lost():
+				case <-ctx.Done():
+					t.Fatal("Lost remained open after deterministic expiry")
+				}
+			},
+		}
 	})
 }
 

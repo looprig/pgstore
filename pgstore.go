@@ -48,16 +48,20 @@ func Open(ctx context.Context, options Options) (*Store, error) {
 		// text because driver errors may retain connection details.
 		return nil, invalidOption("DSN", "PostgreSQL pool configuration was rejected")
 	}
-	if err := migrate(ctx, pool, resolved.schema, resolved.tablePrefix, resolved.migrations); err != nil {
+	if err := migrate(ctx, pool, resolved.schema, resolved.tablePrefix, resolved.migrations, resolved.statementTimeout, resolved.lockTimeout); err != nil {
 		pool.Close()
 		return nil, err
 	}
+	leaseStore := lease.New(pool, resolved.schema, resolved.tablePrefix, resolved.leaseTTL, resolved.leaseRenewInterval, resolved.statementTimeout, resolved.lockTimeout)
 	return &Store{
-		Ledger:       ledger.New(pool, resolved.schema, resolved.tablePrefix),
-		Leaser:       lease.New(pool, resolved.schema, resolved.tablePrefix),
+		Ledger:       ledger.New(pool, resolved.schema, resolved.tablePrefix, resolved.statementTimeout, resolved.lockTimeout),
+		Leaser:       leaseStore,
 		KV:           kv.New(pool, resolved.schema, resolved.tablePrefix),
 		OrderedIndex: orderedindex.New(pool, resolved.schema, resolved.tablePrefix),
-		closePool:    pool.Close,
+		closePool: func() {
+			leaseStore.Close()
+			pool.Close()
+		},
 	}, nil
 }
 

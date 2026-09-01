@@ -148,6 +148,10 @@ func TestOperationErrorsDoNotDiscloseDSNOrCredential(t *testing.T) {
 	defer cancel()
 
 	operations := map[string]func() error{
+		"Leaser.Acquire": func() error {
+			_, err := store.Leaser.Acquire(ctx, "sessions/closed")
+			return err
+		},
 		"Ledger.Append": func() error { return store.Ledger.Append(ctx, "sessions/closed", 0, []byte("x")) },
 		"Ledger.Read": func() error {
 			_, err := store.Ledger.Read(ctx, "sessions/closed", 1)

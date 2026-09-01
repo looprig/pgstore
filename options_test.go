@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 const testDSN = "postgres://looprig:super-secret@db.example.test:5432/looprig?sslmode=verify-full"
@@ -39,6 +41,12 @@ func TestOptionsResolve(t *testing.T) {
 		{name: "negative lock timeout", mutate: func(o *Options) { o.LockTimeout = -time.Second }, wantField: "LockTimeout", wantReason: "must be positive"},
 		{name: "sub-millisecond lock timeout", mutate: func(o *Options) { o.LockTimeout = time.Nanosecond }, wantField: "LockTimeout", wantReason: "at least one millisecond"},
 		{name: "lock timeout exceeds statement timeout", mutate: func(o *Options) { o.LockTimeout = 2 * time.Minute; o.StatementTimeout = time.Minute }, wantField: "LockTimeout", wantReason: "must not exceed StatementTimeout"},
+		{name: "negative lease TTL", mutate: func(o *Options) { o.LeaseTTL = -time.Second }, wantField: "LeaseTTL", wantReason: "must be positive"},
+		{name: "sub-millisecond lease TTL", mutate: func(o *Options) { o.LeaseTTL = time.Nanosecond }, wantField: "LeaseTTL", wantReason: "at least one millisecond"},
+		{name: "negative lease renew interval", mutate: func(o *Options) { o.LeaseRenewInterval = -time.Second }, wantField: "LeaseRenewInterval", wantReason: "must be positive"},
+		{name: "sub-millisecond lease renew interval", mutate: func(o *Options) { o.LeaseRenewInterval = time.Nanosecond }, wantField: "LeaseRenewInterval", wantReason: "at least one millisecond"},
+		{name: "lease renew interval equals TTL", mutate: func(o *Options) { o.LeaseTTL = time.Second; o.LeaseRenewInterval = time.Second }, wantField: "LeaseRenewInterval", wantReason: "must be shorter than LeaseTTL"},
+		{name: "lease renew interval exceeds TTL", mutate: func(o *Options) { o.LeaseTTL = time.Second; o.LeaseRenewInterval = 2 * time.Second }, wantField: "LeaseRenewInterval", wantReason: "must be shorter than LeaseTTL"},
 		{name: "invalid migration mode", mutate: func(o *Options) { o.Migrations = MigrationMode(99) }, wantField: "Migrations", wantReason: "unknown mode"},
 	}
 
@@ -59,6 +67,9 @@ func TestOptionsResolve(t *testing.T) {
 				}
 				if got.statementTimeout != defaultStatementTimeout || got.lockTimeout != defaultLockTimeout {
 					t.Fatalf("resolved timeouts = statement %s lock %s", got.statementTimeout, got.lockTimeout)
+				}
+				if got.leaseTTL != defaultLeaseTTL || got.leaseRenewInterval != defaultLeaseRenewInterval || got.leaseRenewInterval >= got.leaseTTL {
+					t.Fatalf("resolved lease timing = TTL %s renew %s", got.leaseTTL, got.leaseRenewInterval)
 				}
 				return
 			}
@@ -83,14 +94,16 @@ func TestOptionsResolveAppliesValidCustomValues(t *testing.T) {
 	t.Parallel()
 
 	resolved, err := (Options{
-		DSN:              testDSN,
-		MinConns:         2,
-		MaxConns:         4,
-		Schema:           strings.Repeat("s", 63),
-		TablePrefix:      strings.Repeat("p", 39) + "_",
-		StatementTimeout: 2 * time.Second,
-		LockTimeout:      time.Second,
-		Migrations:       MigrationApply,
+		DSN:                testDSN,
+		MinConns:           2,
+		MaxConns:           4,
+		Schema:             strings.Repeat("s", 63),
+		TablePrefix:        strings.Repeat("p", 39) + "_",
+		StatementTimeout:   2 * time.Second,
+		LockTimeout:        time.Second,
+		LeaseTTL:           9 * time.Second,
+		LeaseRenewInterval: 3 * time.Second,
+		Migrations:         MigrationApply,
 	}).resolve()
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
@@ -98,14 +111,20 @@ func TestOptionsResolveAppliesValidCustomValues(t *testing.T) {
 	if resolved.minConns != 2 || resolved.maxConns != 4 || resolved.poolConfig.MinConns != 2 || resolved.poolConfig.MaxConns != 4 {
 		t.Fatalf("resolved pool bounds = (%d, %d), config = (%d, %d)", resolved.minConns, resolved.maxConns, resolved.poolConfig.MinConns, resolved.poolConfig.MaxConns)
 	}
-	if got := resolved.poolConfig.ConnConfig.RuntimeParams["statement_timeout"]; got != "2000" {
-		t.Errorf("statement_timeout = %q, want 2000", got)
+	if _, ok := resolved.poolConfig.ConnConfig.RuntimeParams["statement_timeout"]; ok {
+		t.Error("statement_timeout is a startup RuntimeParam, incompatible with transaction pooling")
 	}
-	if got := resolved.poolConfig.ConnConfig.RuntimeParams["lock_timeout"]; got != "1000" {
-		t.Errorf("lock_timeout = %q, want 1000", got)
+	if _, ok := resolved.poolConfig.ConnConfig.RuntimeParams["lock_timeout"]; ok {
+		t.Error("lock_timeout is a startup RuntimeParam, incompatible with transaction pooling")
+	}
+	if resolved.poolConfig.ConnConfig.DefaultQueryExecMode != pgx.QueryExecModeExec {
+		t.Errorf("query exec mode = %v, want QueryExecModeExec without a connection-local statement cache", resolved.poolConfig.ConnConfig.DefaultQueryExecMode)
 	}
 	if resolved.migrations != MigrationApply {
 		t.Errorf("migrations = %v, want MigrationApply", resolved.migrations)
+	}
+	if resolved.leaseTTL != 9*time.Second || resolved.leaseRenewInterval != 3*time.Second {
+		t.Errorf("lease timing = TTL %s renew %s, want 9s and 3s", resolved.leaseTTL, resolved.leaseRenewInterval)
 	}
 }
 

@@ -2,7 +2,7 @@
 set -eu
 
 snapshot_dir="/private/tmp/pgstore-mutation-snapshot-${UID:-codex}"
-files="go.mod options.go pgstore.go migrations.go internal/guard/guard.go internal/postgres/postgres.go internal/ledger/ledger.go internal/lease/lease.go internal/kv/kv.go internal/orderedindex/orderedindex.go conformance_integration_test.go"
+files="go.mod options.go pgstore.go migrations.go migrations/0002_leases.sql internal/guard/guard.go internal/postgres/postgres.go internal/ledger/ledger.go internal/lease/lease.go internal/kv/kv.go internal/orderedindex/orderedindex.go conformance_integration_test.go"
 
 restore_snapshot() {
 	for snapshot_file in $files; do
@@ -23,16 +23,6 @@ if test "${PGSTORE_MUTATION_RECOVER_ONLY:-}" = 1; then
 	exit 0
 fi
 
-# Preflight. The "local replace directive" mutation rewrites go.mod to point at
-# a sibling storage checkout; without one, module loading fails and the batch
-# aborts partway through, which reads as a broken mutation rather than a missing
-# prerequisite. Say so before any mutation runs.
-if ! test -f ../storage/go.mod; then
-	echo "prerequisite missing: ../storage/go.mod" >&2
-	echo "the 'local replace directive' mutation replaces github.com/looprig/storage with ../storage; run this script from a workspace that has the sibling storage repository checked out" >&2
-	exit 2
-fi
-
 mkdir -p "$snapshot_dir"
 for file in $files; do
 	mkdir -p "$snapshot_dir/$(dirname "$file")"
@@ -46,6 +36,9 @@ run_mutation() {
 	new=$4
 	test_name=$5
 	want=$6
+	if test -n "${PGSTORE_MUTATION_FILTER:-}" && test "$name" != "$PGSTORE_MUTATION_FILTER"; then
+		return
+	fi
 
 	# The previous mutation is restored at the next iteration's entry. If this
 	# process is killed mid-test, the startup recovery above performs this step.
@@ -85,6 +78,9 @@ run_integration_mutation() {
 	new=$4
 	test_name=$5
 	want=$6
+	if test -n "${PGSTORE_MUTATION_FILTER:-}" && test "$name" != "$PGSTORE_MUTATION_FILTER"; then
+		return
+	fi
 
 	restore_snapshot
 	PGSTORE_TEST_DSN=${PGSTORE_TEST_DSN:?PGSTORE_TEST_DSN is required for P1.2 mutations}
@@ -136,6 +132,9 @@ run_mutation "negative timeout" options.go 'if requested < 0 {' 'if false && req
 run_mutation "timeout default" options.go 'if requested == 0 {' 'if false && requested == 0 {' TestOptionsResolve 'valid_defaults'
 run_mutation "timeout millisecond floor" options.go 'if requested < time.Millisecond {' 'if false && requested < time.Millisecond {' TestOptionsResolve 'sub-millisecond_statement_timeout'
 run_mutation "lock bounded by statement" options.go 'if lockTimeout > statementTimeout {' 'if false && lockTimeout > statementTimeout {' TestOptionsResolve 'lock_timeout_exceeds_statement_timeout'
+run_mutation "renew interval bounded by lease TTL" options.go 'if leaseRenewInterval >= leaseTTL {' 'if false && leaseRenewInterval >= leaseTTL {' TestOptionsResolve 'lease_renew_interval_equals_TTL'
+run_mutation "transaction-pool query mode" options.go 'poolConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec' 'poolConfig.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheStatement' TestOptionsResolveAppliesValidCustomValues 'want QueryExecModeExec'
+run_mutation "transaction-pool startup parameter" options.go 'delete(poolConfig.ConnConfig.RuntimeParams, "statement_timeout")' 'poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = "1"' TestOptionsResolveAppliesValidCustomValues 'statement_timeout is a startup RuntimeParam'
 run_mutation "migration enum" options.go 'if o.Migrations > MigrationDisabled {' 'if false && o.Migrations > MigrationDisabled {' TestOptionsResolve 'invalid_migration_mode'
 run_mutation "nil context" internal/guard/guard.go 'if ctx == nil {' 'if false && ctx == nil {' TestOperationRejectsNilContext 'panic:'
 run_mutation "context deadline" internal/guard/guard.go 'if _, ok := ctx.Deadline(); !ok {' 'if _, ok := ctx.Deadline(); ok && false {' TestOpenRequiresDeadline 'want *DeadlineRequiredError'
@@ -146,17 +145,18 @@ run_mutation "nil Close" pgstore.go 'if s == nil {' 'if false && s == nil {' Tes
 run_mutation "idempotent Close" pgstore.go 's.closeOnce.Do(s.closePool)' 's.closePool()' TestStoreCloseIsNilSafeAndIdempotent 'pool close calls = 2'
 run_mutation "local replace directive" go.mod 'go 1.26.6' 'go 1.26.6
 
-replace github.com/looprig/storage => ../storage' TestDependencyBoundary 'replace directives, want none'
+replace github.com/looprig/storage => github.com/looprig/storage v0.6.0' TestDependencyBoundary 'go.mod has 1 replace directives, want none'
 run_mutation "extra direct module" go.mod 'github.com/jackc/puddle/v2 v2.2.2 // indirect' 'github.com/jackc/puddle/v2 v2.2.2' TestDependencyBoundary 'direct modules ='
 run_mutation "logging import" pgstore.go '"context"' '"context"
 	_ "log/slog"' TestDependencyBoundary 'imports logging package "log/slog"'
 run_mutation "Blobs field" pgstore.go 'Ledger       storage.Ledger' 'Blobs        storage.Blobs
 	Ledger       storage.Ledger' TestOpenWiresStructuredPrimitivesWithoutBlobs 'Store exposes a Blobs field'
 
-for operation in Leaser.Acquire OrderedIndex.Get OrderedIndex.Create OrderedIndex.Update OrderedIndex.Delete OrderedIndex.ListOrdered OrderedIndex.ListRanked OrderedIndex.ListDue; do
+for operation in Leaser.Acquire Lease.Release OrderedIndex.Get OrderedIndex.Create OrderedIndex.Update OrderedIndex.Delete OrderedIndex.ListOrdered OrderedIndex.ListRanked OrderedIndex.ListDue; do
 	case $operation in
 		Ledger.*) file=internal/ledger/ledger.go ;;
 		Leaser.*) file=internal/lease/lease.go ;;
+		Lease.*) file=internal/lease/lease.go ;;
 		KV.*) file=internal/kv/kv.go ;;
 		OrderedIndex.*) file=internal/orderedindex/orderedindex.go ;;
 	esac
@@ -164,6 +164,46 @@ for operation in Leaser.Acquire OrderedIndex.Get OrderedIndex.Create OrderedInde
 done
 
 run_mutation "retry SQLSTATE classification" internal/postgres/postgres.go 'pgErr.Code == "40001"' 'pgErr.Code == "40002"' TestRetryableClassifiesOnlySerializationAndDeadlockSQLStates 'Retryable(SQLSTATE 40001) = false, want true'
+run_mutation "lease advisory lock prohibited" internal/lease/lease.go 'const holderTokenBytes = 32' 'const holderTokenBytes = 32
+const forbiddenLeaseSQL = "SELECT pg_advisory_lock(1)"' TestProductionAdvisoryLockOccurrencesAreExactlyTheMigrationLock 'advisory-lock source set ='
+run_mutation "lease acquire row lock" internal/lease/lease.go ' WHERE name = $1 FOR UPDATE' ' WHERE name = $1' TestLeaseAcquireUsesExactlyOneExplicitRowLock 'FOR UPDATE occurrences = 0, want exactly 1'
+run_mutation "lease physical connection retention" internal/lease/lease.go 'var _ storage.Leaser = (*Store)(nil)' 'func (s *Store) retainedConnection(ctx context.Context) (*pgxpool.Conn, error) { return s.pool.Acquire(ctx) }
+
+var _ storage.Leaser = (*Store)(nil)' TestLeaseStoreDoesNotRetainPhysicalPoolConnections 'lease store contains retained physical-connection form'
+run_mutation "lease proof latency" internal/lease/lease.go 'return expiresAt.Sub(databaseNow) - time.Since(proofStarted)' 'return expiresAt.Sub(databaseNow) + 0*time.Since(proofStarted)' TestConservativeRemainingSubtractsTheWholeProofDuration 'want nonpositive after proof latency crossed expiry'
+run_integration_mutation "lease held expiry comparison" internal/lease/lease.go 'currentHolder != nil && expiresAt != nil && expiresAt.After(databaseNow)' 'currentHolder != nil && expiresAt != nil && !expiresAt.After(databaseNow)' TestLeaseExpiryComparisonAtAndAroundThreshold 'want held at epoch'
+run_integration_mutation "lease acquire epoch increment" internal/lease/lease.go 'epoch++' 'epoch += 0' TestLeaseAcquireHeldReleaseAndLaterEpoch 'want live epoch 1'
+run_integration_mutation "lease acquire revision increment" internal/lease/lease.go 'SET epoch = $2, holder = $3, expires_at = clock_timestamp() + $4::bigint * interval '"'"'1 millisecond'"'"', revision = revision + 1 WHERE name = $1' 'SET epoch = $2, holder = $3, expires_at = clock_timestamp() + $4::bigint * interval '"'"'1 millisecond'"'"', revision = revision WHERE name = $1' TestLeaseAcquireHeldReleaseAndLaterEpoch 'persistent row ='
+run_integration_mutation "lease acquire authoritative reread" internal/lease/lease.go 'return s.resolveAcquire(name, epoch, holder)' 'return nil, pginternal.RedactedError("lease acquire")' TestLeaseAcquireResolvesCommittedLostAcknowledgement 'Acquire after committed lost acknowledgement:'
+run_integration_mutation "lease acquire unresolved outcome fails closed" internal/lease/lease.go 'return nil, pginternal.RedactedError("lease acquire outcome resolution")' 'return s.newLease(name, epoch, holder, s.leaseTTL), nil' TestLeaseAcquireRejectsUncommittedLostAcknowledgement 'want no lease and error'
+run_integration_mutation "lease acquire local expiry uses conservative proof" internal/lease/lease.go 'return s.newLease(name, epoch, holder, conservativeRemaining(proofStarted, *expiresAt, databaseNow)), nil' 'return s.newLease(name, epoch, holder, expiresAt.Sub(databaseNow)+0*time.Since(proofStarted)), nil' TestLeaseLocalDeadlineAccountsForCommitLatency 'Lost after commit latency crossed the database expiry remained open'
+run_integration_mutation "lease acquire transaction-local timeouts" internal/lease/lease.go 'if err := pginternal.SetLocalTimeouts(ctx, tx, s.statementTimeout, s.lockTimeout); err != nil {
+		return nil, leaseFailure(ctx, "lease acquire")
+	}' 'if false {
+		return nil, leaseFailure(ctx, "lease acquire")
+	}' TestLeaseAcquireAppliesTransactionLocalLockTimeout 'want transaction-local 50ms lock timeout'
+run_integration_mutation "lease renew epoch predicate" internal/lease/lease.go 'AND epoch = $2 AND holder = $3 AND expires_at > clock_timestamp() RETURNING' 'AND epoch = $2 + 1 AND holder = $3 AND expires_at > clock_timestamp() RETURNING' TestLeaseEpochAndHolderFencesAtAndAroundThreshold 'renew at epoch 1 = <nil>, want pgx.ErrNoRows'
+run_integration_mutation "lease renew holder predicate" internal/lease/lease.go 'AND epoch = $2 AND holder = $3 AND expires_at > clock_timestamp() RETURNING' 'AND epoch = $2 AND holder <> $3 AND expires_at > clock_timestamp() RETURNING' TestLeaseEpochAndHolderFencesAtAndAroundThreshold 'renew with wrong holder = <nil>, want pgx.ErrNoRows'
+run_integration_mutation "lease renew expiry predicate" internal/lease/lease.go 'AND holder = $3 AND expires_at > clock_timestamp() RETURNING' 'AND holder = $3 RETURNING' TestLeaseExpiryClosesLostAndLaterGrantAdvancesEpoch 'Lost after database expiry remained open'
+run_integration_mutation "lease renew revision increment" internal/lease/lease.go 'SET expires_at = clock_timestamp() + $4::bigint * interval '"'"'1 millisecond'"'"', revision = revision + 1 WHERE name = $1 AND epoch' 'SET expires_at = clock_timestamp() + $4::bigint * interval '"'"'1 millisecond'"'"', revision = revision WHERE name = $1 AND epoch' TestLeaseEpochAndHolderFencesAtAndAroundThreshold 'exact writer revision ='
+run_integration_mutation "ambiguous renew skips authoritative reread" internal/lease/lease.go 'result, err = l.store.observe(proofCtx, l)' 'result, err = renewal{remaining: l.store.leaseTTL}, nil
+			_ = proofCtx' TestLeaseAmbiguousRenewClosesLostUnlessAuthoritativeReadProvesOwnership 'Lost after ambiguous renewal observed later epoch remained open'
+run_integration_mutation "lease release epoch predicate" internal/lease/lease.go 'WHERE name = $1 AND epoch = $2 AND holder = $3", lease.name' 'WHERE name = $1 AND epoch = $2 + 1 AND holder = $3", lease.name' TestLeaseReleaseRequiresExactEpochAndHolder 'stale release changed row'
+run_integration_mutation "lease release holder predicate" internal/lease/lease.go 'WHERE name = $1 AND epoch = $2 AND holder = $3", lease.name' 'WHERE name = $1 AND epoch = $2 AND holder <> $3", lease.name' TestLeaseReleaseRequiresExactEpochAndHolder 'stale release changed row'
+run_integration_mutation "lease release resets epoch" internal/lease/lease.go 'SET holder = NULL, expires_at = NULL, revision = revision + 1 WHERE name' 'SET epoch = 0, holder = NULL, expires_at = NULL, revision = revision + 1 WHERE name' TestLeaseAcquireHeldReleaseAndLaterEpoch 'later epoch = 1, want 2'
+run_integration_mutation "lease release freezes revision" internal/lease/lease.go 'SET holder = NULL, expires_at = NULL, revision = revision + 1 WHERE name' 'SET holder = NULL, expires_at = NULL, revision = revision WHERE name' TestLeaseReleaseRequiresExactEpochAndHolder 'exact release revision ='
+run_integration_mutation "lease release omits Lost closure" internal/lease/lease.go '		l.stop()
+		l.markLost()
+		l.store.unregister(l)' '		l.stop()
+		l.store.unregister(l)' TestLeaseAcquireHeldReleaseAndLaterEpoch 'Lost remained open after Release'
+run_integration_mutation "lease canceled release cannot retry" internal/lease/lease.go 'if l.releaseComplete {' 'if l.released {' TestLeaseCanceledReleaseCanBeRetried 'Acquire after release retry:'
+run_integration_mutation "lease local expiry timer" internal/lease/lease.go 'case <-expiryTimer.C:' 'case <-time.After(24 * time.Hour):' TestLeaseLocalDeadlineClosesLostBeforeRenewTick 'Lost at the locally tracked database expiry remained open'
+run_integration_mutation "lease release authoritative reread" internal/lease/lease.go 'l.store.resolveRelease(l)' 'pginternal.RedactedError("lease release")' TestLeaseReleaseResolvesCommittedLostAcknowledgement 'Release after committed lost acknowledgement:'
+run_integration_mutation "lease release unresolved outcome fails closed" internal/lease/lease.go 'if epoch != lease.epoch || !bytes.Equal(holder, lease.holder) || expiresAt == nil || !expiresAt.After(databaseNow) {' 'if true || epoch != lease.epoch || !bytes.Equal(holder, lease.holder) || expiresAt == nil || !expiresAt.After(databaseNow) {' TestLeaseReleaseRejectsUncommittedLostAcknowledgementAndRetries 'Release after uncommitted acknowledgement = nil error'
+run_integration_mutation "lease migration primary key" migrations/0002_leases.sql 'name text PRIMARY KEY,' 'name text UNIQUE NOT NULL,' TestMigrationAddsLeaseTable 'lease constraints ='
+run_integration_mutation "lease migration epoch constraint" migrations/0002_leases.sql 'epoch bigint NOT NULL CHECK (epoch >= 0),' 'epoch bigint NOT NULL,' TestMigrationAddsLeaseTable 'lease constraints ='
+run_integration_mutation "lease migration revision constraint" migrations/0002_leases.sql 'revision bigint NOT NULL CHECK (revision >= 0),' 'revision bigint NOT NULL,' TestMigrationAddsLeaseTable 'lease constraints ='
+run_integration_mutation "lease migration holder expiry parity" migrations/0002_leases.sql 'CHECK ((holder IS NULL) = (expires_at IS NULL))' 'CHECK (true)' TestMigrationAddsLeaseTable 'lease constraints ='
 run_integration_mutation "migration explicit lock" migrations.go 'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))' 'SELECT $1::text' TestConcurrentMigrationOwnersSerializeFromVersionZero 'concurrent Open:'
 run_integration_mutation "ledger per-scope row lock" internal/ledger/ledger.go ' WHERE name = $1 FOR UPDATE' ' WHERE name = $1' TestLedgerConformance 'writer reported error:'
 run_integration_mutation "ledger commit authoritative reread" internal/ledger/ledger.go 'if errors.As(err, &commitErr) {' 'if false && errors.As(err, &commitErr) {' TestAppendResolvesCommitAcknowledgementLossByAuthoritativeRead 'want nil after authoritative reread'
@@ -179,22 +219,16 @@ run_mutation "kv bytewise collation" internal/kv/kv.go 'ORDER BY key COLLATE \"C
 # Seam invariant: an unimplemented operation may never return a nil or zero
 # value without an error. The guard derives the unimplemented set, so the
 # derivation is mutated here too, not just the operations.
-run_mutation "Leaser.Acquire returns nil, nil" internal/lease/lease.go 'return nil, guard.NotImplemented("Leaser.Acquire")' 'return nil, nil' TestSeamOperationsReturnNotImplemented 'does not call guard.NotImplemented'
 run_mutation "OrderedIndex.Create returns zero, true, nil" internal/orderedindex/orderedindex.go 'return storage.OrderedRecord{}, false, guard.NotImplemented("OrderedIndex.Create")' 'return storage.OrderedRecord{}, true, nil' TestSeamOperationsReturnNotImplemented 'does not call guard.NotImplemented'
 run_mutation "OrderedIndex.Delete returns zero, nil" internal/orderedindex/orderedindex.go 'return storage.OrderedRecord{}, guard.NotImplemented("OrderedIndex.Delete")' 'return storage.OrderedRecord{}, nil' TestSeamOperationsReturnNotImplemented 'does not call guard.NotImplemented'
 run_mutation "implemented KV.Get claims NotImplemented" internal/kv/kv.go 'return nil, 0, &storage.KeyNotFoundError{Key: key}' 'return nil, 0, guard.NotImplemented("KV.Get")' TestSeamOperationsReturnNotImplemented 'calls guard.NotImplemented although KV conformance runs'
-run_mutation "unskipped conformance without implementation" conformance_integration_test.go 't.Skip("P1.3 implements PostgreSQL leases")' '_ = 0' TestSeamOperationsReturnNotImplemented 'calls guard.NotImplemented although Leaser conformance runs'
 # The derivation must not be able to lose an input silently. Deleting the
 # interface assertion compiles, because Open still assigns the concrete store to
 # a storage.Leaser field, so nothing else notices; composed with a nil return it
 # would reinstate the exact defect the guard exists to prevent.
 run_mutation "seam derivation input deleted" internal/lease/lease.go 'var _ storage.Leaser = (*Store)(nil)' '' TestSeamOperationsReturnNotImplemented 'the seam derivation lost its input'
-run_mutation "seam derivation input deleted and Acquire returns nil, nil" internal/lease/lease.go 'return nil, guard.NotImplemented("Leaser.Acquire")
-}
-
-var _ storage.Leaser = (*Store)(nil)' 'return nil, nil
-}' TestSeamOperationsReturnNotImplemented 'the seam derivation lost its input'
-run_mutation "conformance entry point removed" conformance_integration_test.go 'func TestLeaserConformance' 'func LeaserConformanceRemoved' TestSeamOperationsReturnNotImplemented 'has no TestLeaserConformance entry point'
+run_mutation "conformance entry point removed" conformance_integration_test.go 'func TestLeaserConformance' 'func LeaserConformanceRemoved' TestSeamOperationsReturnNotImplemented 'TestLeaserLifecycleConformance exists without TestLeaserConformance'
+run_mutation "renewable lifecycle entry point removed" conformance_integration_test.go 'func TestLeaserLifecycleConformance' 'func LeaserLifecycleConformanceRemoved' TestSeamOperationsReturnNotImplemented 'renewable lifecycle conformance set ='
 
 # Identifier budget: PostgreSQL truncates past 63 bytes silently.
 run_mutation "oversized table suffix" internal/orderedindex/orderedindex.go 'var _ storage.OrderedIndex = (*Store)(nil)' 'var dueTable = func(tablePrefix string) string { return tablePrefix + "ordered_index_due_state_page" }
@@ -231,6 +265,12 @@ run_integration_mutation "ledger read leaks DSN" internal/ledger/ledger.go 'retu
 run_integration_mutation "ledger tip leaks DSN" internal/ledger/ledger.go 'return 0, operationFailure(ctx, "ledger tip")' "return 0, errors.New(\"ledger tip failed: ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'Ledger.Tip error disclosed'
 run_integration_mutation "ledger delete resolution leaks DSN" internal/ledger/ledger.go 'return pginternal.RedactedError("ledger delete outcome resolution")' "return errors.New(\"ledger delete outcome resolution failed: ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'Ledger.Delete error disclosed'
 run_integration_mutation "kv get leaks DSN" internal/kv/kv.go 'return nil, 0, failure(ctx, "kv get")' "return nil, 0, pginternal.RedactedError(\"kv get on ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Get error disclosed'
+run_integration_mutation "lease acquire leaks DSN" internal/lease/lease.go 'return nil, leaseFailure(ctx, "lease acquire")' "return nil, pginternal.RedactedError(\"lease acquire on ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'Leaser.Acquire error disclosed'
+# D1: every adapter holding a pool can reach the parsed bare credentials even
+# when the operation does not receive a DSN. These mutations prove the nonce
+# credential guard catches both values through pgxpool.Config.
+run_integration_mutation "D1 kv get leaks bare password" internal/kv/kv.go 'return nil, 0, failure(ctx, "kv get")' 'return nil, 0, pginternal.RedactedError("kv get "+s.pool.Config().ConnConfig.Password)' TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Get error disclosed'
+run_integration_mutation "D1 kv get leaks bare user" internal/kv/kv.go 'return nil, 0, failure(ctx, "kv get")' 'return nil, 0, pginternal.RedactedError("kv get "+s.pool.Config().ConnConfig.User)' TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Get error disclosed'
 run_integration_mutation "kv keys leaks DSN" internal/kv/kv.go 'return nil, failure(ctx, "kv keys")' "return nil, pginternal.RedactedError(\"kv keys on ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Keys error disclosed'
 run_integration_mutation "kv put resolution leaks DSN" internal/kv/kv.go 'return 0, pginternal.RedactedError("kv put outcome resolution")' "return 0, pginternal.RedactedError(\"kv put outcome resolution on ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Put error disclosed'
 run_integration_mutation "kv delete resolution leaks DSN" internal/kv/kv.go 'return pginternal.RedactedError("kv delete outcome resolution")' "return pginternal.RedactedError(\"kv delete outcome resolution on ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Delete error disclosed'

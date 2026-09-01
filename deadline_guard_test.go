@@ -255,6 +255,7 @@ func conformanceSkips(t *testing.T) map[string]bool {
 		t.Fatalf("parse %s: %v", path, err)
 	}
 	skips := make(map[string]bool)
+	lifecycle := make(map[string]bool)
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
 		if !ok || function.Recv != nil || function.Body == nil {
@@ -268,10 +269,20 @@ func conformanceSkips(t *testing.T) map[string]bool {
 		if !found || primitive == "" {
 			continue
 		}
+		if base, secondary := strings.CutSuffix(primitive, "Lifecycle"); secondary && base != "" {
+			lifecycle[base] = true
+			continue
+		}
 		skips[primitive] = callsTestingSkip(function.Body)
 	}
 	if len(skips) == 0 {
 		t.Fatalf("%s declares no Test<Primitive>Conformance entry point", path)
+	}
+	if len(lifecycle) != 1 || !lifecycle["Leaser"] {
+		t.Fatalf("renewable lifecycle conformance set = %v, want exactly map[Leaser:true]", lifecycle)
+	}
+	if _, ok := skips["Leaser"]; !ok {
+		t.Fatal("TestLeaserLifecycleConformance exists without TestLeaserConformance")
 	}
 	return skips
 }
