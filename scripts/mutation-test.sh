@@ -359,7 +359,7 @@ run_mutation "ordered production receiver shadow" internal/orderedindex/orderedi
 	rows, err := s.pool.Query(ctx, statement.SQL, statement.Args...)' 'statement := orderedquery.Ranked(s.recordsTable(), namespace, rankingScope, queryPosition, limit)
 	other := s
 	var rows pgx.Rows
-	{ s := other; rows, err = s.pool.Query(ctx, statement.SQL, statement.Args...) }' TestOrderedIndexPlanGateUsesProductionStatements 'never reads rows through its own receiver'
+	{ s := other; rows, err = s.pool.Query(ctx, statement.SQL, statement.Args...) }' TestOrderedIndexPlanGateUsesProductionStatements 'the page statement must be executed here'
 run_mutation "ordered plan gate dead helper live copied table" orderedindex_plan_integration_test.go 'for _, test := range orderedPlanCases(table, prefix) {' '_ = orderedPlanCases(table, prefix)
 	tests := []orderedPlanCase{{name: "copied", family: orderedPlanOrder, page: orderedPlanFirst, indexName: prefix + "ordered_order_idx", statement: orderedquery.Statement{SQL: "SELECT 1"}, wantArgs: nil}}
 	for _, test := range tests {' TestOrderedIndexPlanGateUsesProductionStatements 'has 0 direct orderedPlanCases ranges, want exactly 1'

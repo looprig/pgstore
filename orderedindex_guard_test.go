@@ -1133,8 +1133,23 @@ func TestProductionOwnershipReportsDelegationAsDelegation(t *testing.T) {
 	if err == nil {
 		t.Fatal("production ownership followed a delegated read it cannot bind")
 	}
-	if !strings.Contains(err.Error(), "it calls read on its receiver") {
+	if !strings.Contains(err.Error(), "it binds rows from read on its receiver") {
 		t.Fatalf("delegation is reported as an absence of any read rather than as delegation: %v", err)
+	}
+
+	// The hint must not call an ordinary receiver helper a delegated read. The
+	// real ListRanked calls s.recordsTable(); reporting that as delegation
+	// states something false about the code.
+	shadow := `q := orderedquery.Ranked(s.recordsTable(), namespace, scope, position, limit); other := s; var rows pgx.Rows; { s := other; rows, _ = s.pool.Query(ctx, q.SQL, q.Args...) }; scanRecords(rows)`
+	err = validateProductionStatementOwnership([]byte(productionOwnershipFixture(ordered, shadow, due)))
+	if err == nil {
+		t.Fatal("production ownership accepted a page read on a shadowed receiver")
+	}
+	if strings.Contains(err.Error(), "recordsTable") {
+		t.Fatalf("a table-name helper is reported as a delegated read: %v", err)
+	}
+	if !strings.Contains(err.Error(), "the page statement must be executed here") {
+		t.Fatalf("receiver shadow does not report where the statement must run: %v", err)
 	}
 }
 
@@ -1612,18 +1627,29 @@ func storeHandles(body *ast.BlockStmt, receiver *ast.Ident) []*ast.Ident {
 // delegationHint distinguishes "this method reads rows somewhere the guard
 // cannot follow" from "this method reads no rows at all", so the message does
 // not assert the absence of something plainly present.
+//
+// It reports only receiver-method calls bound as (value, error), which is the
+// shape of a call that could have produced rows. An earlier revision reported
+// every receiver-method call, and so announced that ListRanked "calls
+// recordsTable on its receiver" as though a table-name helper were a delegated
+// read — the same defect of asserting something false that this hint exists to
+// avoid.
 func delegationHint(body *ast.BlockStmt, receiver *ast.Ident) string {
 	var delegates []string
 	ast.Inspect(body, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
+		assignment, ok := node.(*ast.AssignStmt)
+		if !ok || len(assignment.Lhs) != 2 || len(assignment.Rhs) != 1 {
+			return true
+		}
+		call, ok := unparen(assignment.Rhs[0]).(*ast.CallExpr)
 		if !ok {
 			return true
 		}
 		selector, ok := unparen(call.Fun).(*ast.SelectorExpr)
-		if !ok {
+		if !ok || selector.Sel.Name == "pool" {
 			return true
 		}
-		if base, ok := unparen(selector.X).(*ast.Ident); ok && sameObject(base, receiver) && selector.Sel.Name != "pool" {
+		if base, ok := unparen(selector.X).(*ast.Ident); ok && sameObject(base, receiver) {
 			delegates = append(delegates, selector.Sel.Name)
 		}
 		return true
@@ -1631,7 +1657,7 @@ func delegationHint(body *ast.BlockStmt, receiver *ast.Ident) string {
 	if len(delegates) == 0 {
 		return ""
 	}
-	return fmt.Sprintf(" (it calls %s on its receiver; this guard does not follow a delegated read, because the statement it must bind is built here)", strings.Join(delegates, ", "))
+	return fmt.Sprintf(" (it binds rows from %s on its receiver; this guard does not follow a delegated read, because the statement it must bind is built here)", strings.Join(delegates, ", "))
 }
 
 // bindsScannedRows requires the rows the method decodes to be the rows the
@@ -1881,6 +1907,40 @@ func enclosingFunctionName(file *ast.File, node ast.Node) string {
 	return name
 }
 
+// orderedIsolationProblems reports every explicitly-opened transaction whose
+// isolation level is not the one the ordered mutation protocol requires. It
+// takes a parsed file rather than reading one, so the same code that judges
+// production also produces the message the mutation campaign pins, instead of
+// the campaign's expectation being checked against a hand-written copy of it.
+func orderedIsolationProblems(file *ast.File) (int, []string) {
+	transactions := 0
+	var problems []string
+	ast.Inspect(file, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || callSelectorName(call) != "BeginTx" || len(call.Args) != 2 {
+			return true
+		}
+		transactions++
+		where := enclosingFunctionName(file, call)
+		options, ok := unparen(call.Args[1]).(*ast.CompositeLit)
+		if !ok {
+			problems = append(problems, fmt.Sprintf("%s: BeginTx options are not a literal, so the isolation level cannot be read here", where))
+			return true
+		}
+		level, err := keyedField(options, "IsoLevel")
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s: BeginTx %v; an ordered mutation must pin its isolation level explicitly rather than inherit the session default", where, err))
+			return true
+		}
+		selector, ok := unparen(level).(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "ReadCommitted" {
+			problems = append(problems, fmt.Sprintf("%s: BeginTx runs at %s; the ordered mutation protocol serializes on the per-scope counter row and the authoritative record row, so it must run at pgx.ReadCommitted", where, types.ExprString(level)))
+		}
+		return true
+	})
+	return transactions, problems
+}
+
 // TestOrderedIndexMutationsPinReadCommittedAndExplicitRowLocks reads the parsed
 // tree, not the raw file. The earlier revision used strings.Count over the
 // source, which this file's own header records as an evadable shape: three real
@@ -1898,30 +1958,10 @@ func TestOrderedIndexMutationsPinReadCommittedAndExplicitRowLocks(t *testing.T) 
 	}
 	constants := stringConstants(file)
 
-	transactions := 0
-	ast.Inspect(file, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
-		if !ok || callSelectorName(call) != "BeginTx" || len(call.Args) != 2 {
-			return true
-		}
-		transactions++
-		where := enclosingFunctionName(file, call)
-		options, ok := unparen(call.Args[1]).(*ast.CompositeLit)
-		if !ok {
-			t.Errorf("%s: BeginTx options are not a literal, so the isolation level cannot be read here", where)
-			return true
-		}
-		level, err := keyedField(options, "IsoLevel")
-		if err != nil {
-			t.Errorf("%s: BeginTx %v; an ordered mutation must pin its isolation level explicitly rather than inherit the session default", where, err)
-			return true
-		}
-		selector, ok := unparen(level).(*ast.SelectorExpr)
-		if !ok || selector.Sel.Name != "ReadCommitted" {
-			t.Errorf("%s: BeginTx runs at %s; the ordered mutation protocol serializes on the per-scope counter row and the authoritative record row, so it must run at pgx.ReadCommitted", where, types.ExprString(level))
-		}
-		return true
-	})
+	transactions, isolationProblems := orderedIsolationProblems(file)
+	for _, problem := range isolationProblems {
+		t.Error(problem)
+	}
 	if transactions != 3 {
 		t.Fatalf("orderedindex opens %d transactions with explicit options, want the three mutation paths (create, update, delete)", transactions)
 	}
@@ -1992,5 +2032,83 @@ func TestOrderedIndexMutationsPinReadCommittedAndExplicitRowLocks(t *testing.T) 
 		if len(selectorCallsNamed(body, lockingReaders[0])) != 1 {
 			t.Errorf("%s does not read its record through %s, the one reader that takes the authoritative row lock; without it a concurrent revision check is not serialized", mutation, lockingReaders[0])
 		}
+	}
+}
+
+// campaignWant reads the expected failure text the mutation campaign pins for a
+// named entry, so the anchor is derived from the script rather than copied.
+func campaignWant(t *testing.T, entry string) string {
+	t.Helper()
+	source, err := os.ReadFile("scripts/mutation-test.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := `run_mutation "` + entry + `" `
+	start := strings.Index(string(source), marker)
+	if start < 0 {
+		t.Fatalf("mutation campaign has no entry named %q", entry)
+	}
+	rest := string(source)[start:]
+	if next := strings.Index(rest[1:], "\nrun_"); next >= 0 {
+		rest = rest[:next+1]
+	}
+	quoted := strings.Split(rest, "'")
+	if len(quoted) < 3 {
+		t.Fatalf("entry %q has no quoted expectation", entry)
+	}
+	return quoted[len(quoted)-2]
+}
+
+// TestMutationCampaignAnchorsMatchGuardMessages binds the campaign's expected
+// text to the messages these guards actually produce, in the database-free suite
+// that `make check` runs.
+//
+// Three times now a guard message was improved and the campaign's expectation
+// was left behind, each time discovered only by a full campaign run. Continuing
+// past a stale expectation stops one from truncating the others, but it does not
+// make the drift cheap to find. This does: a rewrite that moves an anchor fails
+// here in milliseconds, with the entry named.
+//
+// The anchors are deliberately verb-free clauses. A message may be reworded
+// around them; these fragments are contract text shared with the campaign.
+func TestMutationCampaignAnchorsMatchGuardMessages(t *testing.T) {
+	t.Parallel()
+	ordered := `q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`
+	due := `q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`
+	for _, test := range []struct{ entry, ranked string }{
+		{
+			entry:  "ordered production dead second receiver query",
+			ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); if false { s.pool.Query(ctx, "SELECT 1") }; rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`,
+		},
+		{
+			entry:  "ordered production receiver shadow",
+			ranked: `q := orderedquery.Ranked(s.recordsTable(), namespace, scope, position, limit); other := s; var rows pgx.Rows; { s := other; rows, _ = s.pool.Query(ctx, q.SQL, q.Args...) }; scanRecords(rows)`,
+		},
+		{
+			entry:  "ordered production copied live query with unused builder",
+			ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); _ = q; rows, _ := s.pool.Query(ctx, "SELECT copied"); scanRecords(rows)`,
+		},
+	} {
+		t.Run(test.entry, func(t *testing.T) {
+			err := validateProductionStatementOwnership([]byte(productionOwnershipFixture(ordered, test.ranked, due)))
+			if err == nil {
+				t.Fatal("the mutation this entry applies is no longer rejected at all")
+			}
+			if want := campaignWant(t, test.entry); !strings.Contains(err.Error(), want) {
+				t.Fatalf("campaign entry %q expects %q, but the guard now reports:\n  %v", test.entry, want, err)
+			}
+		})
+	}
+
+	// The isolation anchor is produced by the guard itself, run over a
+	// downgraded fixture, rather than compared against a copy of its message.
+	downgraded := parseFixture(t, `package fixture
+func (s *Store) createOnce() { tx, _ := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable}); _ = tx }`)
+	count, problems := orderedIsolationProblems(downgraded)
+	if count != 1 || len(problems) != 1 {
+		t.Fatalf("isolation guard saw %d transactions and %d problems in a downgraded fixture, want 1 and 1", count, len(problems))
+	}
+	if want := campaignWant(t, "ordered explicit Read Committed isolation"); !strings.Contains(problems[0], want) {
+		t.Fatalf("campaign entry %q expects %q, but the isolation guard now reports:\n  %s", "ordered explicit Read Committed isolation", want, problems[0])
 	}
 }
