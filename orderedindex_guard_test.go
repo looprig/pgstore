@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -201,6 +202,10 @@ func TestSortingEntryPointClassifierReadsTheOperationNotThePackage(t *testing.T)
 
 // migrationTableSuffixes derives every primitive's table name from the embedded
 // migrations, so a new primitive is denied without anyone extending a list.
+// Index-name placeholders are classified out structurally, by the CREATE INDEX
+// position they appear in rather than by an "_idx" naming convention: an index
+// name is not a table and no package names one in its source, so counting them
+// as tables would make the ownership floor below unsatisfiable.
 func migrationTableSuffixes(t *testing.T) []string {
 	t.Helper()
 	entries, err := os.ReadDir("migrations")
@@ -208,6 +213,8 @@ func migrationTableSuffixes(t *testing.T) []string {
 		t.Fatalf("read migrations: %v", err)
 	}
 	placeholder := regexp.MustCompile(`\{\{([a-z_]+)\}\}`)
+	indexName := regexp.MustCompile(`(?is)CREATE\s+(?:UNIQUE\s+)?INDEX\s+\{\{([a-z_]+)\}\}`)
+	indexes := make(map[string]bool)
 	seen := make(map[string]bool)
 	var suffixes []string
 	for _, entry := range entries {
@@ -218,6 +225,9 @@ func migrationTableSuffixes(t *testing.T) []string {
 		if err != nil {
 			t.Fatalf("read %s: %v", entry.Name(), err)
 		}
+		for _, match := range indexName.FindAllStringSubmatch(string(source), -1) {
+			indexes[match[1]] = true
+		}
 		for _, match := range placeholder.FindAllStringSubmatch(string(source), -1) {
 			if match[1] == "schema" || seen[match[1]] {
 				continue
@@ -226,21 +236,38 @@ func migrationTableSuffixes(t *testing.T) []string {
 			suffixes = append(suffixes, match[1])
 		}
 	}
-	if len(suffixes) == 0 {
+	tables := suffixes[:0:0]
+	for _, suffix := range suffixes {
+		if !indexes[suffix] {
+			tables = append(tables, suffix)
+		}
+	}
+	if len(tables) == 0 {
 		t.Fatal("no migration table placeholders found; the suffix derivation no longer matches the migrations")
 	}
-	return suffixes
+	if len(indexes) == 0 {
+		t.Fatal("no migration index placeholders classified; the index/table split is not matching the migrations")
+	}
+	return tables
 }
 
 // packagesOwningMigrationTables derives which internal package owns each table
 // the migrations create, by finding the package whose production source names
-// the table suffix. Deriving the denied set inverts a hand-written allowlist:
-// widening an allowlist by one name is invisible, whereas a package that owns a
-// migration table is denied by construction the moment it exists.
-func packagesOwningMigrationTables(t *testing.T) map[string]string {
+// the table suffix. Deriving the denied set inverts a hand-written allowlist: a
+// package that owns a migration table is denied by construction the moment it
+// exists.
+//
+// The value is a slice, not a single suffix. A map[package]suffix is
+// last-write-wins, and the ledger owns two tables: ledger_records was
+// overwritten by ledger_scopes and silently left out of the denied set, so a
+// literal naming the ledger's actual data table passed the guard written to
+// forbid exactly that. The anti-vacuity floor moved with it, from counting
+// packages -- of which there were four, so the floor was satisfied -- to
+// counting suffixes, of which five of nine were unrepresented.
+func packagesOwningMigrationTables(t *testing.T) map[string][]string {
 	t.Helper()
 	suffixes := migrationTableSuffixes(t)
-	owners := make(map[string]string)
+	owners := make(map[string][]string)
 	for _, path := range productionGoFiles(t) {
 		directory := filepath.Dir(path)
 		if !strings.HasPrefix(directory, "internal"+string(filepath.Separator)) {
@@ -250,6 +277,7 @@ func packagesOwningMigrationTables(t *testing.T) map[string]string {
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
 		}
+		name := filepath.Base(directory)
 		ast.Inspect(file, func(node ast.Node) bool {
 			literal, ok := node.(*ast.BasicLit)
 			if !ok || literal.Kind != token.STRING {
@@ -260,15 +288,33 @@ func packagesOwningMigrationTables(t *testing.T) map[string]string {
 				return true
 			}
 			for _, suffix := range suffixes {
-				if value == suffix {
-					owners[filepath.Base(directory)] = suffix
+				if value == suffix && !slices.Contains(owners[name], suffix) {
+					owners[name] = append(owners[name], suffix)
 				}
 			}
 			return true
 		})
 	}
-	if len(owners) < 4 {
-		t.Fatalf("derived %d packages owning migration tables (%v); the ownership derivation no longer matches production", len(owners), owners)
+	// Bound the axis the guard actually consumes. Every table the migrations
+	// create must be attributed to the package that owns it; a table no package
+	// claims is a table the fallback denial below cannot see.
+	claimed := 0
+	unclaimed := make([]string, 0, len(suffixes))
+	for _, suffix := range suffixes {
+		owned := false
+		for _, owns := range owners {
+			if slices.Contains(owns, suffix) {
+				owned = true
+			}
+		}
+		if owned {
+			claimed++
+		} else {
+			unclaimed = append(unclaimed, suffix)
+		}
+	}
+	if len(unclaimed) > 0 {
+		t.Fatalf("%d of %d migration tables are claimed by no package (%v); an unclaimed table cannot be denied", len(suffixes)-claimed, len(suffixes), unclaimed)
 	}
 	return owners
 }
@@ -276,14 +322,18 @@ func packagesOwningMigrationTables(t *testing.T) map[string]string {
 func TestOrderedIndexNeverFallsBackToAnotherPrimitive(t *testing.T) {
 	t.Parallel()
 	owners := packagesOwningMigrationTables(t)
-	denied := make(map[string]string)
-	for pkg, suffix := range owners {
-		if !strings.HasPrefix(suffix, "ordered_") {
-			denied[pkg] = suffix
+	denied := make(map[string][]string)
+	deniedTables := 0
+	for pkg, suffixes := range owners {
+		for _, suffix := range suffixes {
+			if !strings.HasPrefix(suffix, "ordered_") {
+				denied[pkg] = append(denied[pkg], suffix)
+				deniedTables++
+			}
 		}
 	}
-	if len(denied) < 3 {
-		t.Fatalf("derived %d sibling primitive packages (%v); the fallback guard has no input", len(denied), denied)
+	if len(denied) < 3 || deniedTables < 4 {
+		t.Fatalf("derived %d sibling packages owning %d tables (%v); the fallback guard has no input", len(denied), deniedTables, denied)
 	}
 
 	for index, file := range parseOrderedProduction(t) {
@@ -297,8 +347,8 @@ func TestOrderedIndexNeverFallsBackToAnotherPrimitive(t *testing.T) {
 			if !strings.HasPrefix(importPath, prefix) {
 				continue
 			}
-			if suffix, isSibling := denied[strings.TrimPrefix(importPath, prefix)]; isSibling {
-				t.Errorf("%s imports %q, which owns the %q table; OrderedIndex has no fallback store", path, importPath, suffix)
+			if suffixes, isSibling := denied[strings.TrimPrefix(importPath, prefix)]; isSibling {
+				t.Errorf("%s imports %q, which owns the %v tables; OrderedIndex has no fallback store", path, importPath, suffixes)
 			}
 		}
 	}
@@ -307,19 +357,33 @@ func TestOrderedIndexNeverFallsBackToAnotherPrimitive(t *testing.T) {
 	// level, which needs no import at all: the ordered statements may name only
 	// the ordered tables.
 	literals := orderedProductionStringLiterals(t)
-	for _, suffix := range denied {
-		pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(suffix) + `\b`)
-		for _, literal := range literals {
-			if pattern.MatchString(literal) {
-				t.Errorf("OrderedIndex literal %q names the %q table of another primitive", literal, suffix)
+	checked := 0
+	for pkg, suffixes := range denied {
+		for _, suffix := range suffixes {
+			checked++
+			pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(suffix) + `\b`)
+			for _, literal := range literals {
+				if pattern.MatchString(literal) {
+					t.Errorf("OrderedIndex literal %q names the %q table, which belongs to the %s primitive", literal, suffix, pkg)
+				}
 			}
 		}
+	}
+	if checked != deniedTables {
+		t.Fatalf("checked %d of %d sibling tables", checked, deniedTables)
 	}
 }
 
 type indexColumn struct {
 	name       string
 	descending bool
+	// nullsFirst is resolved, not raw: PostgreSQL defaults DESC to NULLS FIRST
+	// and ASC to NULLS LAST, so an index declared "rank_value DESC" and an
+	// ORDER BY written "rank_value DESC NULLS LAST" are different orders and
+	// the second needs a sort. Every ordered column is NOT NULL today, so this
+	// changes no current verdict; it is here so the guard's reach matches what
+	// it claims rather than silently accepting an order it cannot answer.
+	nullsFirst bool
 }
 
 type declaredIndex struct {
@@ -355,10 +419,22 @@ func parseIndexColumns(list string) []indexColumn {
 		if dot := strings.LastIndex(name, "."); dot >= 0 {
 			name = name[dot+1:]
 		}
-		columns = append(columns, indexColumn{
-			name:       strings.Trim(name, `"`),
-			descending: len(fields) > 1 && strings.EqualFold(fields[1], "DESC"),
-		})
+		column := indexColumn{name: strings.Trim(name, `"`)}
+		explicit := false
+		for index, field := range fields[1:] {
+			if strings.EqualFold(field, "DESC") {
+				column.descending = true
+			}
+			if strings.EqualFold(field, "NULLS") && index+2 < len(fields) {
+				explicit = true
+				column.nullsFirst = strings.EqualFold(fields[index+2], "FIRST")
+			}
+		}
+		if !explicit {
+			// PostgreSQL's defaults: DESC implies NULLS FIRST, ASC NULLS LAST.
+			column.nullsFirst = column.descending
+		}
+		columns = append(columns, column)
 	}
 	return columns
 }
@@ -448,9 +524,6 @@ func readAccessPath(sql string) (statementAccessPath, error) {
 }
 
 // coveringIndex reports the declared index that answers the statement without a
-// sort: every leading index column the statement does not pin to a constant
-// must be exactly the next ordering column, in the same direction.
-// coveringIndex reports the declared index that answers the statement without a
 // sort, or the reason each declared index cannot.
 func coveringIndex(indexes []declaredIndex, path statementAccessPath) (string, bool, []string) {
 	var reasons []string
@@ -464,23 +537,48 @@ func coveringIndex(indexes []declaredIndex, path statementAccessPath) (string, b
 	return "", false, reasons
 }
 
-// normalizeSQLFragment removes the cosmetic differences — surrounding
-// parentheses and whitespace runs — that make two spellings of one predicate
-// look unequal.
-func normalizeSQLFragment(fragment string) string {
+// stripEnclosingParens removes only parentheses that wrap the whole fragment,
+// and collapses whitespace. It does not remove interior parentheses: those are
+// structure, not decoration.
+func stripEnclosingParens(fragment string) string {
 	fragment = strings.Join(strings.Fields(fragment), " ")
 	for {
-		trimmed := strings.TrimSpace(fragment)
-		if len(trimmed) < 2 || trimmed[0] != '(' || trimmed[len(trimmed)-1] != ')' {
-			break
+		if len(fragment) < 2 || fragment[0] != '(' {
+			return fragment
 		}
-		inner, end := balancedParenthesis(trimmed, 0)
-		if end != len(trimmed)-1 {
-			break
+		inner, end := balancedParenthesis(fragment, 0)
+		if end != len(fragment)-1 {
+			return fragment
 		}
-		fragment = inner
+		fragment = strings.Join(strings.Fields(inner), " ")
 	}
-	return strings.ReplaceAll(strings.ReplaceAll(fragment, "(", ""), ")", "")
+}
+
+// topLevelConjuncts splits a WHERE clause on AND at parenthesis depth zero, so
+// a disjunction inside parentheses stays one conjunct instead of being read as
+// the conjuncts it happens to contain.
+func topLevelConjuncts(clause string) []string {
+	var conjuncts []string
+	depth, start := 0, 0
+	upper := strings.ToUpper(clause)
+	for i := 0; i < len(clause); i++ {
+		switch clause[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		}
+		if depth != 0 {
+			continue
+		}
+		if strings.HasPrefix(upper[i:], " AND ") {
+			conjuncts = append(conjuncts, stripEnclosingParens(clause[start:i]))
+			i += len(" AND ") - 1
+			start = i + 1
+		}
+	}
+	conjuncts = append(conjuncts, stripEnclosingParens(clause[start:]))
+	return conjuncts
 }
 
 // indexAnswers returns "" when the index answers the statement, and otherwise
@@ -488,10 +586,16 @@ func normalizeSQLFragment(fragment string) string {
 // repeat is a fact about the migration and the statement together, so the
 // reason says which side it read.
 func indexAnswers(index declaredIndex, path statementAccessPath) string {
-	where := normalizeSQLFragment(path.where)
+	// Compare top-level conjunct sets, not substrings. Deleting parentheses and
+	// substring-matching turned a structural test back into a textual one:
+	// "(due_state = 1 OR legacy_due)" and even "NOT (due_state = 1)" both
+	// contained the index predicate as text while describing rows the partial
+	// index does not hold.
+	statementConjuncts := topLevelConjuncts(path.where)
 	for _, conjunct := range index.predicate {
-		if !strings.Contains(where, normalizeSQLFragment(conjunct)) {
-			return fmt.Sprintf("it is declared in the migration as a partial index over %q, which this statement's WHERE does not repeat", conjunct)
+		want := stripEnclosingParens(conjunct)
+		if !slices.Contains(statementConjuncts, want) {
+			return fmt.Sprintf("it is declared in the migration as a partial index over %q, which is not one of this statement's top-level WHERE conjuncts %v", want, statementConjuncts)
 		}
 	}
 	columns := index.columns
@@ -501,10 +605,14 @@ func indexAnswers(index declaredIndex, path statementAccessPath) string {
 	if len(columns) < len(path.orderBy) {
 		return fmt.Sprintf("only %d of its columns remain unpinned, fewer than the %d ordering columns", len(columns), len(path.orderBy))
 	}
+	// A backward index scan reverses the column directions and the nulls
+	// placement together, so both invert as one.
 	for _, inverted := range []bool{false, true} {
 		matched := true
 		for i, want := range path.orderBy {
-			if columns[i].name != want.name || columns[i].descending != (want.descending != inverted) {
+			if columns[i].name != want.name ||
+				columns[i].descending != (want.descending != inverted) ||
+				columns[i].nullsFirst != (want.nullsFirst != inverted) {
 				matched = false
 				break
 			}
@@ -513,7 +621,7 @@ func indexAnswers(index declaredIndex, path statementAccessPath) string {
 			return ""
 		}
 	}
-	return "its remaining key does not match the ordering columns in either scan direction"
+	return "its remaining key does not match the ordering columns, their directions, or their nulls placement in either scan direction"
 }
 
 type coveredPageStatement struct {
@@ -613,6 +721,8 @@ func TestIndexCoverageClassifierAcceptsLegalAccessPaths(t *testing.T) {
 		{"due page read backwards", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND due_state = 1 AND NOT deleted AND due_at <= $2 ORDER BY due_at DESC, stable_key DESC, ordering_scope DESC LIMIT $3"},
 		{"ordered page read backwards", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ordering_scope = $2 ORDER BY order_id DESC, stable_key DESC LIMIT $3"},
 		{"partial predicate written with parentheses", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND (due_state = 1) AND (NOT deleted) AND due_at <= $2 ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT $3"},
+		{"nulls placement written out to match the index", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted ORDER BY rank_value DESC NULLS FIRST, stable_key DESC NULLS FIRST, ordering_scope DESC NULLS FIRST LIMIT $3"},
+		{"backward scan inverts nulls placement with direction", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted ORDER BY rank_value ASC NULLS LAST, stable_key ASC NULLS LAST, ordering_scope ASC NULLS LAST LIMIT $3"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path, err := readAccessPath(test.sql)
@@ -638,6 +748,13 @@ func TestIndexCoverageClassifierRejectsUnbackedStatements(t *testing.T) {
 		{"scope no longer pinned", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 ORDER BY " + table + ".order_id ASC, stable_key ASC LIMIT $3"},
 		{"due partial-index predicate dropped", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND due_state = 1 ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT $3"},
 		{"ordering tail truncated to a non-key column", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted ORDER BY rank_value DESC, revision DESC LIMIT $3"},
+		// R4: a disjunction and an inversion both contain the index predicate
+		// as text while describing rows the partial index does not hold.
+		{"partial predicate widened by a disjunction", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND (due_state = 1 OR legacy_due) AND NOT deleted AND due_at <= $2 ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT $3"},
+		{"partial predicate inverted", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND NOT (due_state = 1) AND NOT deleted AND due_at <= $2 ORDER BY due_at ASC, stable_key ASC, ordering_scope ASC LIMIT $3"},
+		// R7: the index is DESC, which resolves to NULLS FIRST; NULLS LAST is a
+		// different order and PostgreSQL would have to sort for it.
+		{"explicit nulls placement the index cannot answer", "SELECT " + columns + " FROM " + table + " WHERE namespace = $1 AND ranking_scope = $2 AND ranked AND NOT deleted ORDER BY rank_value DESC NULLS LAST, stable_key DESC NULLS LAST, ordering_scope DESC NULLS LAST LIMIT $3"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path, err := readAccessPath(test.sql)
@@ -954,6 +1071,70 @@ func TestProductionOwnershipRejectsEveryExecutionSpelling(t *testing.T) {
 				t.Fatal("production ownership accepted an extra or substituted execution spelling")
 			}
 		})
+	}
+}
+
+// TestProductionOwnershipBindsTheRowsThatAreDecoded covers the class receiver
+// binding alone left open. Binding by ast.Object identity accepted a
+// reassignment, because a reassignment keeps the same object: the mandated read
+// was bound and then the page was served from another store's pool.
+func TestProductionOwnershipBindsTheRowsThatAreDecoded(t *testing.T) {
+	t.Parallel()
+	ordered := `q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`
+	due := `q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`
+	for _, test := range []struct{ name, ranked string }{
+		{name: "rows reassigned from another store's pool", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); rows, _ = fallback.pool.Query(ctx, "SELECT copied"); scanRecords(rows)`},
+		{name: "rows conditionally swapped for a cached reader", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); if cached != nil { rows = cached }; scanRecords(rows)`},
+		{name: "mandated rows never consumed", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); _ = rows; scanRecords(other)`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateProductionStatementOwnership([]byte(productionOwnershipFixture(ordered, test.ranked, due))); err == nil {
+				t.Fatal("production ownership accepted a page decoded from rows the mandated statement did not return")
+			}
+		})
+	}
+}
+
+// TestProductionOwnershipAllowsEveryFormOfTheStoreHandle pins the shapes that
+// are the same database handle written differently. An earlier revision
+// required the read to be literally receiver.pool.Query, which rejected an
+// alias and — incoherently — rejected a transaction the same guard had already
+// counted as a handle.
+func TestProductionOwnershipAllowsEveryFormOfTheStoreHandle(t *testing.T) {
+	t.Parallel()
+	ordered := `q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`
+	due := `q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`
+	for _, test := range []struct{ name, ranked string }{
+		{name: "local alias of the receiver pool", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); pool := s.pool; rows, _ := pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`},
+		{name: "read inside a transaction from the receiver pool", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); tx, _ := s.pool.BeginTx(ctx, opts); rows, _ := tx.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`},
+		{name: "read inside a transaction from an aliased pool", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); pool := s.pool; tx, _ := pool.BeginTx(ctx, opts); rows, _ := tx.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`},
+		{name: "consumer is not named scanRecords", ranked: `q := orderedquery.Ranked(table, namespace, scope, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); decodeOrderedPage(rows)`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateProductionStatementOwnership([]byte(productionOwnershipFixture(ordered, test.ranked, due))); err != nil {
+				t.Fatalf("production ownership rejected a legal spelling of the store's own handle: %v", err)
+			}
+		})
+	}
+}
+
+// TestProductionOwnershipReportsDelegationAsDelegation is a documented boundary,
+// not a closed hole. A page read moved into a receiver method cannot be bound
+// without interprocedural dataflow, and accepting an unfollowed delegate would
+// reopen the copied-statement class outright: the delegate could execute
+// anything. The guard therefore requires page statements to be executed in the
+// List method, and says so, rather than claiming no rows are read.
+func TestProductionOwnershipReportsDelegationAsDelegation(t *testing.T) {
+	t.Parallel()
+	ordered := `q := orderedquery.Ordered(table, namespace, scope, after, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`
+	due := `q := orderedquery.Due(table, namespace, bound, position, limit); rows, _ := s.pool.Query(ctx, q.SQL, q.Args...); scanRecords(rows)`
+	ranked := `q := orderedquery.Ranked(table, namespace, scope, position, limit); rows, _ := s.read(ctx, q); scanRecords(rows)`
+	err := validateProductionStatementOwnership([]byte(productionOwnershipFixture(ordered, ranked, due)))
+	if err == nil {
+		t.Fatal("production ownership followed a delegated read it cannot bind")
+	}
+	if !strings.Contains(err.Error(), "it calls read on its receiver") {
+		t.Fatalf("delegation is reported as an absence of any read rather than as delegation: %v", err)
 	}
 }
 
@@ -1365,18 +1546,20 @@ func validateProductionStatementOwnership(source []byte) error {
 		if len(statements) != 1 {
 			return fmt.Errorf("List%s has %d direct orderedquery.%s statement assignments, want exactly 1", family, len(statements), family)
 		}
-		// Bound to the receiver's pool and to any transaction opened from it,
-		// and restricted to calls that can actually produce the page. A
-		// decoy Exec, CopyFrom or BeginTx cannot return rows, so counting it
-		// would reject a legal implementation without protecting anything.
-		receivers := append([]*ast.Ident{receiver}, bindingsFromCall(function.Body, "BeginTx", []*ast.Ident{receiver})...)
-		reads := rowReturningCallsOn(function.Body, receivers)
+		// The store's database handles: the receiver itself (whose .pool the
+		// selector walk reaches), any local alias bound directly from that
+		// pool, and any transaction opened from either. All three are the same
+		// handle by construction, so a page read through any of them is the
+		// store reading its own database, and only a read through something
+		// else is a read the guard cannot account for.
+		//
+		// An earlier revision counted the transaction as a handle and then
+		// rejected the read for not being literally receiver.pool.Query, which
+		// is two models disagreeing inside one guard.
+		handles := storeHandles(function.Body, receiver)
+		reads := rowReturningCallsOn(function.Body, handles)
 		if len(reads) == 0 {
-			// Distinct from the count message below: rows may well be read
-			// here, just not through the receiver this guard binds. A shadowed
-			// or foreign receiver is exactly how a page arrives from somewhere
-			// the guard cannot see.
-			return fmt.Errorf("List%s never reads rows through its own receiver's pool; a page read on a shadowed or foreign receiver is not the statement this guard binds", family)
+			return fmt.Errorf("List%s never reads rows through its own store handle%s; the page statement must be executed here, on this store's pool or a transaction from it", family, delegationHint(function.Body, receiver))
 		}
 		if len(reads) != 1 {
 			return fmt.Errorf("List%s reads rows %d times (%s). The page must come from the one orderedquery statement, so exactly one Query is allowed.", family, len(reads), strings.Join(callNames(reads), ", "))
@@ -1385,7 +1568,7 @@ func validateProductionStatementOwnership(source []byte) error {
 		if callSelectorName(query) != "Query" {
 			return fmt.Errorf("List%s reads its page with %s; a page is many rows and must be read with Query so every row is scanned", family, callSelectorName(query))
 		}
-		if !isReceiverPoolCall(query, receiver) || len(query.Args) != 3 || query.Ellipsis == token.NoPos ||
+		if len(query.Args) != 3 || query.Ellipsis == token.NoPos ||
 			!isStatementSelector(query.Args[1], statements[0], "SQL") ||
 			!isStatementSelector(query.Args[2], statements[0], "Args") {
 			return fmt.Errorf("List%s Query is not its receiver-bound pool consuming the one orderedquery.%s statement SQL and variadic Args", family, family)
@@ -1400,30 +1583,118 @@ func validateProductionStatementOwnership(source []byte) error {
 	return nil
 }
 
-// bindsScannedRows requires the rows the method decodes to be the rows the
-// mandated Query returned.
-func bindsScannedRows(body *ast.BlockStmt, query *ast.CallExpr) error {
-	var rows *ast.Ident
+// storeHandles collects the identifiers that denote this store's own database
+// handle inside one method body: the receiver, any local alias of its pool, and
+// any transaction opened from either.
+func storeHandles(body *ast.BlockStmt, receiver *ast.Ident) []*ast.Ident {
+	handles := []*ast.Ident{receiver}
 	ast.Inspect(body, func(node ast.Node) bool {
 		assignment, ok := node.(*ast.AssignStmt)
-		if !ok || len(assignment.Lhs) == 0 || len(assignment.Rhs) == 0 || unparen(assignment.Rhs[0]) != ast.Expr(query) {
+		if !ok || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 {
 			return true
 		}
-		if identifier, ok := assignment.Lhs[0].(*ast.Ident); ok {
-			rows = identifier
+		selector, ok := unparen(assignment.Rhs[0]).(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "pool" {
+			return true
+		}
+		base, ok := unparen(selector.X).(*ast.Ident)
+		if !ok || !sameObject(base, receiver) {
+			return true
+		}
+		if alias, ok := assignment.Lhs[0].(*ast.Ident); ok {
+			handles = append(handles, alias)
+		}
+		return true
+	})
+	return append(handles, bindingsFromCall(body, "BeginTx", handles)...)
+}
+
+// delegationHint distinguishes "this method reads rows somewhere the guard
+// cannot follow" from "this method reads no rows at all", so the message does
+// not assert the absence of something plainly present.
+func delegationHint(body *ast.BlockStmt, receiver *ast.Ident) string {
+	var delegates []string
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := unparen(call.Fun).(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if base, ok := unparen(selector.X).(*ast.Ident); ok && sameObject(base, receiver) && selector.Sel.Name != "pool" {
+			delegates = append(delegates, selector.Sel.Name)
+		}
+		return true
+	})
+	if len(delegates) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (it calls %s on its receiver; this guard does not follow a delegated read, because the statement it must bind is built here)", strings.Join(delegates, ", "))
+}
+
+// bindsScannedRows requires the rows the method decodes to be the rows the
+// mandated Query returned, and requires that binding to be the only one.
+//
+// Object identity alone was not enough: a reassignment keeps the same
+// ast.Object, so `rows, _ := s.pool.Query(...)` followed by
+// `rows, _ = fallback.pool.Query(...)` bound the mandated call and then served
+// the page from somewhere else, which is the whole class this check exists to
+// close. Requiring a single definition is what makes the binding mean anything.
+//
+// The consumer is not named. Requiring a call literally spelled scanRecords
+// made a rename report that the scan was absent when it was plainly present;
+// with exactly one read on the store's handles, whatever consumes these rows
+// consumes the mandated statement's rows.
+func bindsScannedRows(body *ast.BlockStmt, query *ast.CallExpr) error {
+	var rows *ast.Ident
+	assignments := 0
+	ast.Inspect(body, func(node ast.Node) bool {
+		assignment, ok := node.(*ast.AssignStmt)
+		if !ok || len(assignment.Lhs) == 0 {
+			return true
+		}
+		if len(assignment.Rhs) > 0 && unparen(assignment.Rhs[0]) == ast.Expr(query) {
+			if identifier, ok := assignment.Lhs[0].(*ast.Ident); ok {
+				rows = identifier
+			}
 		}
 		return true
 	})
 	if rows == nil {
 		return fmt.Errorf("the mandated Query result is not bound to a variable, so nothing proves its rows are the ones decoded")
 	}
-	scans := freeCallsNamed(body, "scanRecords")
-	if len(scans) != 1 || len(scans[0].Args) != 1 {
-		return fmt.Errorf("has %d single-argument scanRecords calls, want exactly 1", len(scans))
+	ast.Inspect(body, func(node ast.Node) bool {
+		assignment, ok := node.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for _, left := range assignment.Lhs {
+			if identifier, ok := left.(*ast.Ident); ok && sameObject(identifier, rows) {
+				assignments++
+			}
+		}
+		return true
+	})
+	if assignments != 1 {
+		return fmt.Errorf("the rows variable is assigned %d times; a reassignment can replace the mandated statement's rows with another reader's after the binding is made, so it must be defined exactly once", assignments)
 	}
-	scanned, ok := unparen(scans[0].Args[0]).(*ast.Ident)
-	if !ok || !sameObject(scanned, rows) {
-		return fmt.Errorf("scanRecords decodes rows that did not come from the mandated Query")
+	consumed := false
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		for _, argument := range call.Args {
+			if identifier, ok := unparen(argument).(*ast.Ident); ok && sameObject(identifier, rows) {
+				consumed = true
+			}
+		}
+		return true
+	})
+	if !consumed {
+		return fmt.Errorf("the rows the mandated Query returned are never passed to anything, so the page is not decoded from them")
 	}
 	return nil
 }
@@ -1447,19 +1718,6 @@ func storeMethodsNamed(file *ast.File, name string) []storeMethod {
 		methods = append(methods, storeMethod{function: function, receiver: receiverField.Names[0]})
 	}
 	return methods
-}
-
-func isReceiverPoolCall(call *ast.CallExpr, receiver *ast.Ident) bool {
-	methodSelector, ok := unparen(call.Fun).(*ast.SelectorExpr)
-	if !ok || methodSelector.Sel.Name != "Query" {
-		return false
-	}
-	poolSelector, ok := unparen(methodSelector.X).(*ast.SelectorExpr)
-	if !ok || poolSelector.Sel.Name != "pool" {
-		return false
-	}
-	candidate, ok := unparen(poolSelector.X).(*ast.Ident)
-	return ok && sameObject(candidate, receiver)
 }
 
 func orderedQueryCall(expression ast.Expr) (string, *ast.CallExpr, bool) {
@@ -1518,11 +1776,16 @@ func TestOrderedIndexMigrationCarriesExactPhysicalIndexes(t *testing.T) {
 	for _, index := range indexes {
 		got[index.name] = index.columns
 	}
+	// descending columns resolve to NULLS FIRST, ascending to NULLS LAST.
+	asc := func(name string) indexColumn { return indexColumn{name: name} }
+	desc := func(name string) indexColumn {
+		return indexColumn{name: name, descending: true, nullsFirst: true}
+	}
 	want := map[string][]indexColumn{
-		"primary key":       {{name: "namespace"}, {name: "ordering_scope"}, {name: "stable_key"}},
-		"ordered_order_idx": {{name: "namespace"}, {name: "ordering_scope"}, {name: "order_id"}, {name: "stable_key"}},
-		"ordered_rank_idx":  {{name: "namespace"}, {name: "ranking_scope"}, {name: "rank_value", descending: true}, {name: "stable_key", descending: true}, {name: "ordering_scope", descending: true}},
-		"ordered_due_idx":   {{name: "namespace"}, {name: "due_state"}, {name: "due_at"}, {name: "stable_key"}, {name: "ordering_scope"}},
+		"primary key":       {asc("namespace"), asc("ordering_scope"), asc("stable_key")},
+		"ordered_order_idx": {asc("namespace"), asc("ordering_scope"), asc("order_id"), asc("stable_key")},
+		"ordered_rank_idx":  {asc("namespace"), asc("ranking_scope"), desc("rank_value"), desc("stable_key"), desc("ordering_scope")},
+		"ordered_due_idx":   {asc("namespace"), asc("due_state"), asc("due_at"), asc("stable_key"), asc("ordering_scope")},
 	}
 	for name, columns := range want {
 		if !reflect.DeepEqual(got[name], columns) {
@@ -1577,12 +1840,17 @@ func resolveStringExpression(expression ast.Expr, constants map[string]string) s
 	return "\uFFFD"
 }
 
-func packageStringConstants(file *ast.File) map[string]string {
+// stringConstants collects every string constant in the file, including those
+// declared inside a function body. Walking only file.Decls missed a local
+// const, which is the idiomatic placement for a suffix used in one function:
+// the guard then resolved the operand to U+FFFD and reported the lock as
+// absent from behaviour-preserving code.
+func stringConstants(file *ast.File) map[string]string {
 	constants := make(map[string]string)
-	for _, declaration := range file.Decls {
-		general, ok := declaration.(*ast.GenDecl)
+	ast.Inspect(file, func(node ast.Node) bool {
+		general, ok := node.(*ast.GenDecl)
 		if !ok || general.Tok != token.CONST {
-			continue
+			return true
 		}
 		for _, spec := range general.Specs {
 			value, ok := spec.(*ast.ValueSpec)
@@ -1597,7 +1865,8 @@ func packageStringConstants(file *ast.File) map[string]string {
 				constants[value.Names[0].Name] = unquoted
 			}
 		}
-	}
+		return true
+	})
 	return constants
 }
 
@@ -1627,7 +1896,7 @@ func TestOrderedIndexMutationsPinReadCommittedAndExplicitRowLocks(t *testing.T) 
 	if err != nil {
 		t.Fatalf("parse %s: %v", path, err)
 	}
-	constants := packageStringConstants(file)
+	constants := stringConstants(file)
 
 	transactions := 0
 	ast.Inspect(file, func(node ast.Node) bool {
@@ -1674,24 +1943,35 @@ func TestOrderedIndexMutationsPinReadCommittedAndExplicitRowLocks(t *testing.T) 
 		t.Errorf("orderedindex executes %d statements that lock the per-scope counter row with FOR UPDATE, want exactly 1: concurrent creates in one ordering scope serialize on that row", counterLocks)
 	}
 
-	// The shared authoritative-row lock, bound to the call that carries it
-	// rather than to the name of the helper that makes the call.
+	// The shared authoritative-row lock, found by the lock suffix any call
+	// passes rather than by the name of the helper that passes it. Searching
+	// for calls literally spelled getFrom made a rename report the lock as
+	// missing when it was plainly present; the suffix is the thing that locks
+	// the row, so the suffix is what the guard looks for. A whole statement
+	// that happens to end in FOR UPDATE — the per-scope counter read above — is
+	// not a suffix, so the two do not collide.
 	var lockingReaders []string
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
 		if !ok || function.Body == nil {
 			continue
 		}
+		carries := false
 		ast.Inspect(function.Body, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
-			if !ok || callSelectorName(call) != "getFrom" || len(call.Args) != 4 {
+			if !ok {
 				return true
 			}
-			if strings.Contains(resolveStringExpression(call.Args[3], constants), "FOR UPDATE") {
-				lockingReaders = append(lockingReaders, function.Name.Name)
+			for _, argument := range call.Args {
+				if strings.TrimSpace(resolveStringExpression(argument, constants)) == "FOR UPDATE" {
+					carries = true
+				}
 			}
 			return true
 		})
+		if carries {
+			lockingReaders = append(lockingReaders, function.Name.Name)
+		}
 	}
 	if len(lockingReaders) != 1 {
 		t.Fatalf("orderedindex has %d row readers that append FOR UPDATE (%s), want exactly 1 shared by update and delete", len(lockingReaders), strings.Join(lockingReaders, ", "))

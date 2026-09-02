@@ -2,14 +2,61 @@
 set -eu
 
 snapshot_dir="/private/tmp/pgstore-mutation-snapshot-${UID:-codex}"
+# Integration entries interpolate the DSN into their argument list, which set -u
+# expands before the function's own filter check can return. Default it here so a
+# filtered database-free run is possible; run_integration_mutation still refuses
+# to run without a real one.
+PGSTORE_TEST_DSN=${PGSTORE_TEST_DSN:-}
 # Repository-owned scratch. Scoped to this run and removed on every exit path,
 # including an interrupt: a build cache left behind is this repository's litter,
 # not the operator's.
 cache_dir="/private/tmp/pgstore-gocache-$$"
-cleanup_scratch() {
+completed=0
+
+# The epilogue must be unconditional. Two separate ways of dying before it were
+# measured -- a renamed test under set -e, and a DSN expanded under set -u --
+# and both ended the run with no summary, no class label, and in one case an
+# exit status of 0. A truncated campaign that looks like a pass is worse than
+# one that fails, so the summary runs from the EXIT trap and any path that
+# reaches it early is labelled ABORTED and exits nonzero.
+finish() {
+	trap - EXIT INT TERM
+	restore_snapshot
+	rm -rf "$snapshot_dir"
 	rm -rf "$cache_dir"
+	if test "$completed" -ne 1; then
+		echo "ABORTED|the campaign exited before its epilogue after $total mutations; the results above are truncated and are not a pass"
+		exit 1
+	fi
+	if test -n "${PGSTORE_MUTATION_EXPECTED_TOTAL:-}"; then
+		expected_total=$PGSTORE_MUTATION_EXPECTED_TOTAL
+		expected_source="PGSTORE_MUTATION_EXPECTED_TOTAL from the environment"
+	else
+		expected_total=154
+		expected_source="script default"
+	fi
+	if test -n "${PGSTORE_MUTATION_FILTER:-}"; then
+		echo "TOTAL=$total KILLED=$killed EXPECTED=(not checked: PGSTORE_MUTATION_FILTER=$PGSTORE_MUTATION_FILTER)"
+		if test "$total" -eq 0; then
+			echo "PGSTORE_MUTATION_FILTER=$PGSTORE_MUTATION_FILTER matched no entry; a run that measured nothing is not a pass"
+			exit 1
+		fi
+	else
+		echo "TOTAL=$total KILLED=$killed EXPECTED=$expected_total ($expected_source)"
+	fi
+	if test -n "$failures"; then
+		echo "UNKILLED MUTATIONS:"
+		printf '%s' "$failures"
+		exit 1
+	fi
+	if test -z "${PGSTORE_MUTATION_FILTER:-}" && test "$total" -ne "$expected_total"; then
+		echo "campaign ran $total mutations, want $expected_total ($expected_source): entries cannot be lost silently"
+		exit 1
+	fi
+	echo "ALL $killed MUTATIONS KILLED"
+	exit 0
 }
-trap 'cleanup_scratch' EXIT INT TERM
+trap 'finish' EXIT INT TERM
 files="go.mod options.go pgstore.go migrations.go migrations/0002_leases.sql migrations/0003_ordered_index.sql internal/guard/guard.go internal/postgres/postgres.go internal/ledger/ledger.go internal/lease/lease.go internal/kv/kv.go internal/orderedindex/orderedindex.go internal/orderedquery/orderedquery.go conformance_integration_test.go orderedindex_plan_integration_test.go"
 
 restore_snapshot() {
@@ -67,7 +114,16 @@ run_mutation() {
 	# process is killed mid-test, the startup recovery above performs this step.
 	restore_snapshot
 	total=$((total + 1))
-	GOWORK=off GOCACHE="$cache_dir" go test -list "^${test_name}$" ./... | grep -qx "$test_name"
+	# A renamed or deleted test must be classified, not fatal. Under set -e the
+	# failing grep in this pipeline used to kill the whole script mid-run, with
+	# no class label and no epilogue -- the same silent truncation the failure
+	# accounting above exists to prevent, for the one trigger it did not cover.
+	# A test rename is at least as likely as a message rewrite.
+	if ! GOWORK=off GOCACHE="$cache_dir" go test -list "^${test_name}$" ./... 2>/dev/null | grep -qx "$test_name"; then
+		echo "MISSING_TEST|$name|$test_name|no test with this name exists"
+		record_failure "MISSING_TEST|$name|$test_name"
+		return
+	fi
 	if ! grep -Fq "$old" "$file"; then
 		echo "DRIFTED|$name|$test_name|mutation pattern no longer present in $file"
 		record_failure "DRIFTED|$name"
@@ -115,7 +171,11 @@ run_integration_mutation() {
 	PGSTORE_TEST_DSN=${PGSTORE_TEST_DSN:?PGSTORE_TEST_DSN is required for P1.2 mutations}
 	export PGSTORE_TEST_DSN
 	total=$((total + 1))
-	GOWORK=off GOCACHE="$cache_dir" go test -tags integration -list "^${test_name}$" ./... | grep -qx "$test_name"
+	if ! GOWORK=off GOCACHE="$cache_dir" go test -tags integration -list "^${test_name}$" ./... 2>/dev/null | grep -qx "$test_name"; then
+		echo "MISSING_TEST|$name|$test_name|no test with this name exists"
+		record_failure "MISSING_TEST|$name|$test_name"
+		return
+	fi
 	if ! grep -Fq "$old" "$file"; then
 		echo "DRIFTED|$name|$test_name|mutation pattern no longer present in $file"
 		record_failure "DRIFTED|$name"
@@ -380,18 +440,4 @@ run_integration_mutation "kv put resolution leaks DSN" internal/kv/kv.go 'return
 run_integration_mutation "kv delete resolution leaks DSN" internal/kv/kv.go 'return pginternal.RedactedError("kv delete outcome resolution")' "return pginternal.RedactedError(\"kv delete outcome resolution on ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Delete error disclosed'
 run_integration_mutation "migration failure leaks DSN" migrations.go 'return pginternal.RedactedError("schema migration")' "return errors.New(\"schema migration failed: ${PGSTORE_TEST_DSN}\")" TestMigrationErrorsDoNotDiscloseDSNOrCredential 'error disclosed'
 
-restore_snapshot
-rm -rf "$snapshot_dir"
-cleanup_scratch
-
-echo "TOTAL=$total KILLED=$killed"
-if test -n "$failures"; then
-	echo "UNKILLED MUTATIONS:"
-	printf '%s' "$failures"
-	exit 1
-fi
-if test -z "${PGSTORE_MUTATION_FILTER:-}" && test "$total" -ne "${PGSTORE_MUTATION_EXPECTED_TOTAL:-154}"; then
-	echo "campaign ran $total mutations, want ${PGSTORE_MUTATION_EXPECTED_TOTAL:-154}: entries cannot be lost silently"
-	exit 1
-fi
-echo "ALL $killed MUTATIONS KILLED"
+completed=1

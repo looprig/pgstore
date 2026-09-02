@@ -49,10 +49,11 @@ second row above shows.
 Two symptoms are worth naming, because neither is the one a reader would guess.
 Through the module's own API the error is redacted, so a failure reads
 `pgstore: ledger append failed` and says nothing about prepared statements. The
-raw text appears only where a harness pool reports its own error directly, and
-it appears in two forms: `prepared statement "stmtcache_..." does not exist`
-(SQLSTATE 26000) in the ledger read-lock harness, and `prepared statement
-"stmtcache_..." already exists` (SQLSTATE 42P05) in the migration upgrade test.
+raw text appears only where a harness pool reports its own error directly, in
+two forms: `prepared statement "stmtcache_..." does not exist` (SQLSTATE 26000)
+and `prepared statement "stmtcache_..." already exists` (SQLSTATE 42P05). Which
+harnesses surface them, and how many times, varies between runs with pool
+scheduling; the forms are stable, the sites and counts are not.
 
 Closing this means routing every harness pool through the same
 `pgxpool.ParseConfig` and exec-mode configuration `Open` applies, rather than
