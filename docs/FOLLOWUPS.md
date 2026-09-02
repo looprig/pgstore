@@ -33,7 +33,16 @@ instead, and so inherit pgx's default statement-caching exec mode:
 | PgBouncer setting | Result |
 |---|---|
 | default (`SHOW CONFIG` reports `max_prepared_statements = 200`) | the **entire** integration suite passes, every package |
-| `MAX_PREPARED_STATEMENTS=0` | `internal/kv` and `internal/postgres` pass; `internal/ledger`, `internal/lease` and `internal/orderedindex` fail; the root package fails only `TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss`, while the Ledger/KV/Leaser/OrderedIndex conformance tests, which obtain their store from `Open`, pass |
+| `MAX_PREPARED_STATEMENTS=0`, pooler just started | every package passes |
+| `MAX_PREPARED_STATEMENTS=0`, pooler with warm server connections | `internal/ledger`, `internal/lease`, `internal/orderedindex` **and `internal/kv`** fail; only `internal/postgres` passes; the root package fails only `TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss`, while the Ledger/KV/Leaser/OrderedIndex conformance tests, which obtain their store from `Open`, pass in every configuration |
+
+An earlier revision of this table recorded `internal/kv` as passing at
+`max_prepared_statements = 0`. That was a real measurement taken against a
+freshly started pooler, and it is not stable: the outcome depends on whether a
+reused server connection still carries another client's prepared statements,
+which `server_reset_query_always=0` leaves in place in transaction mode.
+`docs/OPERATIONS.md` records the full pooler configuration and the reproduction
+command.
 
 PgBouncer has tracked and replayed named prepared statements in transaction
 mode since 1.21, so at the default configuration pgx's default exec mode is

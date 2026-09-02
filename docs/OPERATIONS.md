@@ -24,6 +24,35 @@ each major:
 | 17 | 17.11 | pass | pass | pass | **pass** (6/6 packages) |
 | 18 | 18.6  | pass | pass | pass | **pass** (6/6 packages) |
 
+The "crash" column above covers the ambiguous-commit and cancellation tests, and
+additionally `TestLeaseDatabaseRestartClosesLost`, which restarts the database
+container underneath a held lease and asserts that `Lost()` closes. **That test
+is gated on `PGSTORE_TEST_DOCKER_CONTAINER` and skips silently without it** — it
+is the only test in the module that skips when `PGSTORE_TEST_DSN` is set, and an
+earlier revision of this table was recorded with it skipped. Re-run with the
+gate enabled it passes on all five majors:
+
+```sh
+PGSTORE_TEST_DOCKER_CONTAINER=<container name> \
+PGSTORE_TEST_DSN=... GOWORK=off go test -tags integration -run TestLeaseDatabaseRestartClosesLost ./internal/lease
+```
+
+| Major | 14 | 15 | 16 | 17 | 18 |
+|---|---|---|---|---|---|
+| `TestLeaseDatabaseRestartClosesLost` | pass | pass | pass | pass | pass |
+
+Set `PGSTORE_TEST_DOCKER_CONTAINER` to the name of the disposable container
+serving `PGSTORE_TEST_DSN`; the test issues `docker restart` against it, so it
+requires a container you own and are willing to interrupt.
+
+**Run it on its own, with `-run`, and not as part of a full suite against a
+shared container.** Restarting the database underneath a parallel run fails
+every other test that happens to be mid-query: measured, setting the variable
+for `go test -tags integration ./...` against one shared container turned a
+clean run into 38 unrelated failures, while the same suite without the variable
+and the gated test alone both pass. That interaction is why the test is gated
+rather than merely slow.
+
 No production SQL in this module is version-gated: the schema uses only
 long-standing types and constructs, and the one non-obvious builtin,
 `hashtextextended`, has existed since PostgreSQL 11.
@@ -69,21 +98,55 @@ with `set_config('statement_timeout', …, true)`.
 
 The consequences, stated plainly because they are easy to assume away:
 
-- **Statements outside a transaction carry no server-side timeout.** That
-  includes every `KV` operation and the single-statement read paths of the other
-  primitives — `Get`, `ListOrdered`, `ListRanked`, `ListDue`, `Ledger.Read`,
-  `Ledger.Tip`. On a pooled connection these inherit the server's own
+- **Statements outside a transaction carry no server-side timeout.** That is
+  every `KV` operation, the single-statement reads `Get`, `ListOrdered`,
+  `ListRanked`, `ListDue`, `Ledger.Read` and `Ledger.Tip`, **and — the one with
+  the worst consequence — `Ledger.Delete`, which is a write that takes row
+  locks.** On a pooled connection these inherit the server's own
   `statement_timeout`, which is `0` (unlimited) by default.
-- Those paths are bounded **only** by the caller's context deadline, which pgx
-  turns into query cancellation. Every operation, including `Open`, requires
-  such a deadline and returns `DeadlineRequiredError` without one, so they are
-  bounded — but by the caller, not by the database.
+- **`Ledger.Delete` honours neither `LockTimeout` nor `StatementTimeout`.**
+  Measured on `postgres:17` with `StatementTimeout=800ms`, `LockTimeout=400ms`
+  and an independent session holding the scope row `FOR UPDATE`:
+
+  | Operation | Elapsed | Outcome |
+  |---|---|---|
+  | `Ledger.Append` (transactional, applies `set_config`) | **414ms** | fails at `LockTimeout` |
+  | `Ledger.Delete` (`s.pool.Exec`, no transaction) | **6.011s** | blocks until the caller's 6s context deadline |
+
+  If a scope has an in-flight `Append`, a concurrent `Ledger.Delete` pins a pool
+  connection for the caller's entire budget rather than failing at
+  `LockTimeout`. At the default `MaxConns` of 10 that is a pool-exhaustion
+  vector, so give `Ledger.Delete` a context deadline you would be willing to
+  spend a connection on.
+- Those paths are bounded by the caller's context deadline, which pgx turns into
+  query cancellation. Every operation, including `Open`, requires such a
+  deadline and returns `DeadlineRequiredError` without one — so they are
+  bounded, but by the caller rather than by the database.
+- **The ambiguity-resolution reads are the exception, and are bounded
+  internally.** After a lost acknowledgement, `resolveAppend`, `resolveDelete`,
+  `resolvePut`, `resolveDelete` (KV), `resolveAcquire`, `resolveRelease`,
+  `resolveCreate` and `resolveMutation` each perform an authoritative reread on
+  a context of their own with a fixed 5s budget
+  (`internal/postgres.AuthoritativeReadTimeout`), deliberately detached from the
+  caller's — a caller whose deadline has already expired must still learn the
+  committed outcome. The lease renew loop's `observe` is bounded differently
+  again: by the lease's own safety deadline, not by that constant.
 - `internal/kv` is constructed without timeout arguments at all; it opens no
   explicit transaction and issues no `set_config`.
 
-If you need a server-enforced ceiling on those reads, set `statement_timeout` on
-the database role or in the server configuration. This module will not set it
-for you.
+**A `statement_timeout` you put in the DSN is discarded without an error.**
+Measured: for a DSN carrying `statement_timeout=200`, pgx parses
+`RuntimeParams: map[statement_timeout:200]` and a raw `pgxpool` from that same
+DSN reports `statement_timeout=200ms` and cancels `pg_sleep(2)` after 209ms
+(SQLSTATE 57014). After `Options.resolve` the same field is `map[]`, and `Open`
+accepts the DSN silently. The removal is deliberate — a startup parameter does
+not survive a transaction-pooling proxy — but the obvious first attempt at
+setting a ceiling is the one that is silently dropped.
+
+If you need a server-enforced ceiling, set `statement_timeout` on the database
+role (`ALTER ROLE … SET statement_timeout = …`) or in the server configuration,
+where the pooler cannot lose it. This module will not set it for you, and will
+not tell you that it removed yours.
 
 ## TLS
 
@@ -141,22 +204,50 @@ holds no server-session state to lose:
 - Lease ownership is proved by an epoch and a random holder token compared
   inside row transactions, never by a session-held lock.
 
-**Measured**, against `postgres:17` behind `edoburu/pgbouncer:v1.25.2-p0` in
-`pool_mode = transaction`:
+**Measured** against `postgres:17` behind `edoburu/pgbouncer:v1.25.2-p0`. The
+exact configuration matters, because the result at
+`max_prepared_statements = 0` is not stable across runs:
+
+```
+POOL_MODE=transaction  AUTH_TYPE=scram-sha-256  ADMIN_USERS=postgres
+pool_mode=transaction        max_client_conn=100      default_pool_size=20
+min_pool_size=0              reserve_pool_size=0      server_lifetime=3600
+server_idle_timeout=600      server_reset_query="DISCARD ALL"
+server_reset_query_always=0  ignore_startup_parameters=extra_float_digits
+```
+
+Reproduce with:
+
+```sh
+PGSTORE_TEST_DSN='postgres://…@127.0.0.1:56432/postgres?sslmode=disable'   GOWORK=off go test -tags integration -race -count=1 ./...
+```
 
 | Pooler setting | Result |
 |---|---|
-| default (`SHOW CONFIG` reports `max_prepared_statements = 200`) | the **entire** integration suite passes, all six packages |
-| `MAX_PREPARED_STATEMENTS=0` | `internal/kv` and `internal/postgres` pass; `internal/ledger`, `internal/lease` and `internal/orderedindex` fail; the root package fails only `TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss`, while the Ledger/KV/Leaser/OrderedIndex conformance tests pass |
+| default (`max_prepared_statements = 200`) | the **entire** integration suite passes, all six packages |
+| `MAX_PREPARED_STATEMENTS=0`, pooler just started | every package passes |
+| `MAX_PREPARED_STATEMENTS=0`, pooler with warm server connections | `internal/ledger`, `internal/lease`, `internal/orderedindex` **and `internal/kv`** fail; only `internal/postgres` passes; the root package fails only `TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss`, and the Ledger/KV/Leaser/OrderedIndex conformance tests pass in every configuration |
 
-**Read that second row carefully, because it is a fact about the test harnesses
-and not about this module.** Those suites build their own pools with raw
-`pgxpool.New`, which bypasses the `Open` configuration above and inherits pgx's
-default statement-caching exec mode. They pass at the pooler's default because
-PgBouncer has tracked and replayed named prepared statements in transaction mode
-since 1.21 — that is, because the pooler compensates, not because the harnesses
-exercise what `Open` configures. The conformance tests, which obtain their store
-from `Open`, pass in both configurations. This is recorded as an open item in
+**The pooler's own connection state, not test order, decides it.** Measured over
+three cycles, alternating a `docker restart` of the pooler with a rerun against
+the same one: `internal/kv` passed 3/3 on a freshly started pooler and failed
+3/3 on a reused one, and the two tests involved
+(`TestResolvePutAbsentProvesCanceledCreateDidNotCommit`,
+`TestPutAndDeleteResolveLostAcknowledgementsThroughPublicAPI`) behave the same
+way individually. The mechanism is `server_reset_query_always=0`: in transaction
+mode PgBouncer does not run `DISCARD ALL` between clients, so a server
+connection keeps prepared statements created for a previous client, and a raw
+pool's cached statement name may collide with, or be missing from, whichever
+server connection it is next assigned.
+
+**Read that table as a fact about the test harnesses, not about this module.**
+Those suites build their own pools with raw `pgxpool.New`, which bypasses the
+`Open` configuration above and inherits pgx's default statement-caching exec
+mode. They pass at the pooler's default because PgBouncer has tracked and
+replayed named prepared statements in transaction mode since 1.21 — that is,
+because the pooler compensates, not because the harnesses exercise what `Open`
+configures. The conformance tests, which obtain their store from `Open`, pass in
+every configuration measured. This is recorded as an open item in
 `docs/FOLLOWUPS.md`.
 
 Through the module's own API the error is redacted, so a failure reads
@@ -170,33 +261,98 @@ raw text surfaces only from a harness pool, in two forms:
 All state is ordinary table data in one schema, so a standard `pg_dump` of that
 schema is a complete backup and needs no special handling.
 
-**Restoring an older snapshot is not a neutral operation, and the reason is
-worth understanding before you need it.** Two identifiers that callers rely on
-being monotonic are derived from stored rows, not from a sequence or a clock:
-the lease `epoch` is read `FOR UPDATE` and incremented, and the OrderedIndex
-`next_order` counter is read and incremented in the same transaction. Restoring
-rewinds both.
+**Restoring an older snapshot is not a neutral operation.** Three identifiers
+that callers rely on being monotonic are derived from stored rows rather than
+from a sequence or a clock, so restoring rewinds all three:
 
-Measured end to end on `postgres:17` — take a dump while a lease is held and
-three records exist, do more work, then drop and restore that dump:
+| Identifier | Where | How it is allocated |
+|---|---|---|
+| lease `epoch` | `<prefix>leases` | read `FOR UPDATE`, incremented |
+| `next_order` | `<prefix>ordered_scopes` | read and incremented in the same transaction |
+| `revision` | `<prefix>kv`, `<prefix>ordered_records` | the compare-and-swap token every caller passes back |
+
+Measured end to end on `postgres:17` — take a dump, do more work, drop and
+restore that dump:
 
 | Stage | Observed |
 |---|---|
-| before backup | lease epoch 1; orders 1, 2, 3 |
-| after further work | lease epoch 2; orders 4, 5, 6 |
+| before backup | lease epoch 1; orders 1, 2; KV key at revision 3 |
+| after further work | lease epoch 2; orders 3, 4; KV key at revision 4, content `"d"` |
 | immediately after restore | `Acquire` fails: `storage: lease "demo" held by epoch 1` — the restored row grants ownership to a holder that no longer exists |
-| after the restored expiry passes | `Acquire` returns **epoch 2**, already issued to a different holder before the backup; `Create` issues **order 4**, duplicating an order already handed out |
+| after the restored expiry passes | `Acquire` returns **epoch 2**, already issued to a different holder; `Create` issues **order 4**, duplicating one already handed out |
 
-So a restore has two distinct effects. First, a **ghost holder**: until the
-restored `expires_at` passes, the lease is held by a process that is not
-running, and no one can acquire it. Second, and more serious, **identifier
-reuse**: epochs and acceptance orders that were already observed by callers are
-handed out a second time, which defeats the fencing that the epoch exists to
-provide.
+### The `revision` rewind is the dangerous one
 
-If you restore into a system whose consumers have already seen the newer
-identifiers, treat the fencing guarantee as broken until you have reconciled
-them. This module cannot detect the situation for you.
+The lease and order rewinds fail closed or are at least observable: a ghost
+holder blocks acquisition, and a duplicate order is visible in the data. **A
+rewound `revision` silently destroys a write.**
+
+Measured, continuing the same run:
+
+1. Caller C reads the key and holds **revision 4** with content `"d"`.
+2. Restore rewinds the key to **revision 3**, content `"c"`.
+3. Writer B does a correct compare-and-swap at revision 3 and advances the key
+   to **revision 4** with content `"B-write"`.
+4. Caller C's compare-and-swap at revision 4 — a revision that now describes
+   content C never saw — **succeeds**. Final content is `"C-write"`; B's write
+   is gone, with no error anywhere.
+
+That is a classic ABA lost update, and no participant can detect it.
+
+### Order reuse violates the Storage contract
+
+`storage.OrderedRecord` specifies that Order is *"nonzero, immutable, strictly
+increasing within its order scope, and **never reused** there — including after
+a tombstone."* Reissuing order 4 after a restore is therefore not merely a
+surprising operational property; it is a violation of the Storage v0.6.0
+contract this module implements, and downstream code is entitled to have relied
+on it.
+
+### Safe restore procedure
+
+**Verified.** Before admitting any consumer to the restored database, push every
+rewound identifier past the highest value already issued. `<margin>` is any
+headroom you are comfortable with; the example below uses 1000.
+
+```sql
+-- 1 and 2: close the ghost-holder window and the order reuse.
+UPDATE <schema>.<prefix>leases
+   SET epoch = <highest epoch ever issued> + <margin>, holder = NULL, expires_at = NULL;
+UPDATE <schema>.<prefix>ordered_scopes
+   SET next_order = <highest order ever issued> + <margin>;
+
+-- 3: close the ABA window. The two statements above do not touch any CAS token.
+UPDATE <schema>.<prefix>kv              SET revision = revision + <margin>;
+UPDATE <schema>.<prefix>ordered_records SET revision = revision + <margin>;
+```
+
+Measured after applying all four against the restored database above:
+
+- `Acquire` returned in **2ms with no ghost window**, at epoch 1003 against a
+  high-water mark of 2.
+- `Create` issued order **1005** against a high-water mark of 4.
+- Caller C's stale compare-and-swap at revision 4 **failed closed** rather than
+  succeeding.
+- An OrderedIndex `Update` at a stale revision 1 failed closed with
+  `revision conflict: expected 1, actual 1001`.
+- A caller that re-reads and then writes at the current revision still works
+  normally (`Put` at revision 1005 → 1006).
+
+Sparse allocation is explicitly permitted: Storage says order *"need not be the
+next integer: allocation may be sparse"*, so the epoch and order jumps are
+contract-legal. The revision bump is an out-of-band administrative change rather
+than an `Update`, and its observable effect on a caller is the same as another
+writer having advanced the record — a conflict, which is the fail-closed
+direction.
+
+**This procedure needs high-water marks, and that is its limit.** They are
+available when you restore *over* a database you can still read, or from an
+out-of-band record of the highest values issued. In a **total-loss** restore,
+where the newer state is simply gone, there is no way to know how far to advance
+and therefore **no safe procedure** — the only sound options are to accept that
+fencing and CAS guarantees are broken until every consumer has been restarted
+with fresh state, or to have kept that out-of-band record in advance. This
+module cannot detect the situation for you.
 
 ## Metrics and observability
 
@@ -247,6 +403,18 @@ PGSTORE_TEST_DSN=... GOWORK=off go test -tags integration -race ./...
 PGSTORE_TEST_DSN=... sh scripts/mutation-test.sh
 ```
 
-Integration tests skip when `PGSTORE_TEST_DSN` is unset. Each provisions its own
+Environment variables the test suite reads:
+
+| Variable | Effect when unset |
+|---|---|
+| `PGSTORE_TEST_DSN` | every integration test skips |
+| `PGSTORE_TEST_DOCKER_CONTAINER` | `TestLeaseDatabaseRestartClosesLost` skips; everything else still runs. Set it only for a targeted `-run` of that test — see above |
+| `PGSTORE_MUTATION_FILTER` | the campaign runs every entry rather than one |
+| `PGSTORE_MUTATION_EXPECTED_TOTAL` | the campaign pins its entry count to the script default |
+| `PGSTORE_MUTATION_RECOVER_ONLY` | the campaign runs normally rather than only restoring a prior snapshot |
+
+The full documented command set therefore leaves one test skipped unless
+`PGSTORE_TEST_DOCKER_CONTAINER` is also set. Integration tests skip when
+`PGSTORE_TEST_DSN` is unset. Each provisions its own
 uniquely prefixed schema objects rather than sharing a fixture, so they are safe
 to run concurrently against one disposable database.

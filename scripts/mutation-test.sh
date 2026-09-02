@@ -1,7 +1,19 @@
 #!/bin/sh
 set -eu
 
-snapshot_dir="/private/tmp/pgstore-mutation-snapshot-${UID:-codex}"
+# The snapshot directory is scoped to this checkout, not just to this user.
+#
+# It used to be one fixed global path shared by every run, while restore_snapshot
+# copies *relative* paths into the current directory. A campaign started in one
+# worktree would therefore restore another worktree's files into its own tree and
+# delete the shared snapshot on the way past -- and a run later interrupted in
+# the first worktree would then find no snapshot and leave its mutant in place.
+# That is not hypothetical: it left a live mutant in the main checkout during a
+# release review, and two concurrent campaigns is exactly what a release review
+# produces.
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+repo_key=$(printf '%s' "$repo_root" | cksum | cut -d' ' -f1)
+snapshot_dir="/private/tmp/pgstore-mutation-snapshot-${UID:-codex}-$repo_key"
 # Integration entries interpolate the DSN into their argument list, which set -u
 # expands before the function's own filter check can return. Default it here so a
 # filtered database-free run is possible; run_integration_mutation still refuses
@@ -84,7 +96,18 @@ finish() {
 trap 'finish' EXIT INT TERM
 files="go.mod options.go pgstore.go migrations.go migrations/0002_leases.sql migrations/0003_ordered_index.sql internal/guard/guard.go internal/postgres/postgres.go internal/ledger/ledger.go internal/lease/lease.go internal/kv/kv.go internal/orderedindex/orderedindex.go internal/orderedquery/orderedquery.go conformance_integration_test.go orderedindex_plan_integration_test.go"
 
+# restore_snapshot refuses a snapshot that was taken from a different checkout.
+# Scoping the path already prevents the collision; this refuses to write one
+# tree's files into another even if two paths ever hash alike, because the
+# failure mode it guards against is silent and destructive.
 restore_snapshot() {
+	if test -f "$snapshot_dir/.origin"; then
+		snapshot_origin=$(cat "$snapshot_dir/.origin")
+		if test "$snapshot_origin" != "$repo_root"; then
+			echo "FOREIGN_SNAPSHOT|$snapshot_dir was taken from $snapshot_origin, not $repo_root; refusing to restore into this checkout"
+			return 0
+		fi
+	fi
 	for snapshot_file in $files; do
 		if test -f "$snapshot_dir/$snapshot_file"; then
 			cp "$snapshot_dir/$snapshot_file" "$snapshot_file"
@@ -106,6 +129,7 @@ if test "${PGSTORE_MUTATION_RECOVER_ONLY:-}" = 1; then
 fi
 
 mkdir -p "$snapshot_dir"
+printf '%s' "$repo_root" > "$snapshot_dir/.origin"
 for file in $files; do
 	mkdir -p "$snapshot_dir/$(dirname "$file")"
 	cp "$file" "$snapshot_dir/$file"

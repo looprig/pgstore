@@ -79,11 +79,13 @@ _ = structured
 Do not log `Options.DSN` when reporting an `Open` failure.
 
 Statement and lock timeouts are applied **per transaction**, not on the
-connection, so that they survive a transaction-pooling proxy. Single-statement
-paths — every `KV` operation, and the direct reads of the other primitives — are
-therefore bounded by the caller's context deadline rather than by a server-side
-`statement_timeout`. `docs/OPERATIONS.md` sets out what that does and does not
-guarantee.
+connection, so that they survive a transaction-pooling proxy. Paths that run
+outside a transaction — every `KV` operation, the direct reads of the other
+primitives, and `Ledger.Delete`, which is a write — are therefore bounded by the
+caller's context deadline rather than by a server-side `statement_timeout`. A
+`statement_timeout` supplied in the DSN is removed for the same reason, without
+an error. `docs/OPERATIONS.md` sets out what that does and does not guarantee,
+with measurements.
 
 `pgstore` exposes no metrics, tracing, or logging of any kind. That is
 deliberate: the module must never emit a DSN or a credential, and the surest way
