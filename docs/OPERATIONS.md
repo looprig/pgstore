@@ -227,8 +227,8 @@ PGSTORE_TEST_DSN='postgres://…@127.0.0.1:56432/postgres?sslmode=disable'   GOW
 
 | Pooler setting | Result |
 |---|---|
-| default (`max_prepared_statements = 200`) | all six packages pass in most runs, but **the default is not deterministic either**: `internal/ledger` failed 2 of 9 warm full-suite runs. It never failed in 8 runs of that package alone, so reproducing it needs the full parallel suite — consistent with the mechanism below |
-| `MAX_PREPARED_STATEMENTS=0`, pooler just started | **not** a clean pass. `internal/ledger`, `internal/lease`, `internal/orderedindex` and the root package (`TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss`) fail on a freshly started pooler too; only `internal/kv` and `internal/postgres` pass. Measured five ways: three `docker restart` cycles, a brand-new never-used container, and a fresh pooler run with `-p 1` |
+| default (`max_prepared_statements = 200`) | all six packages pass in most runs, but **the default is not deterministic either**: `internal/ledger` failed 2 of 9 warm full-suite runs. It never failed in 8 runs of that package alone, so reproducing it needs the full parallel suite. The cause was not isolated: the error text was never captured, and eight targeted runs of that package plus three further full-suite runs all passed |
+| `MAX_PREPARED_STATEMENTS=0`, pooler just started | **not** a clean pass. `internal/ledger`, `internal/lease`, `internal/orderedindex` and the root package (`TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss`) fail on every one of six fresh-pooler runs: three `docker restart` cycles, a brand-new never-used container, a fresh pooler at `-p 1`, and a fresh pooler at default parallelism against a clean PostgreSQL 17. `internal/postgres` passes. `internal/kv` is the only package whose result moves with pooler warmth — it passed five of those six fresh runs; see below |
 | `MAX_PREPARED_STATEMENTS=0`, pooler with warm server connections | `internal/ledger`, `internal/lease`, `internal/orderedindex` **and `internal/kv`** fail; only `internal/postgres` passes; the root package fails only `TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss`, and the Ledger/KV/Leaser/OrderedIndex conformance tests pass in every configuration |
 
 **Pooler warmth changes exactly one package: `internal/kv`.** The other four
@@ -236,17 +236,19 @@ failures at `MAX_PREPARED_STATEMENTS=0` — `internal/ledger`, `internal/lease`,
 `internal/orderedindex` and the root migration test — are present on a freshly
 started pooler as well, so pooler freshness does not explain them. For
 `internal/kv` the pooler's own connection state, not test order, decides it:
-measured over three cycles alternating a `docker restart` of the pooler with a
-rerun against the same one, `internal/kv` passed 3/3 on a freshly started pooler
-and failed 3/3 on a reused one, and the two tests involved
+in the restart experiment specifically — three cycles alternating a
+`docker restart` of the pooler with a rerun against the same one — `internal/kv`
+passed 3/3 on the freshly started pooler and failed 3/3 on the reused one, and
+the two tests involved
 (`TestResolvePutAbsentProvesCanceledCreateDidNotCommit`,
 `TestPutAndDeleteResolveLostAcknowledgementsThroughPublicAPI`) behave the same
-way individually. Parallel execution is enough to warm the pooler inside a
-single otherwise-fresh run: fresh plus `-p 1` passes `internal/kv`, fresh plus
-the default parallelism fails it. Running sequentially was tested as a rescue
-hypothesis for the other four and disproved — with `-p 1` on a fresh pooler the
-same four still fail. The mechanism is `server_reset_query_always=0`: in transaction
-mode PgBouncer does not run `DISCARD ALL` between clients, so a server
+way individually. Parallel execution can warm the pooler inside a single
+otherwise-fresh run, so a fresh pooler is not reliably cold at default
+parallelism: `internal/kv` passed four of five fresh runs at default parallelism
+and failed the fifth, and passed a fresh `-p 1` run. Running sequentially was
+tested as a rescue hypothesis for the other four and disproved — with `-p 1` on
+a fresh pooler the same four still fail. The mechanism is
+`server_reset_query_always=0`: in transaction mode PgBouncer does not run `DISCARD ALL` between clients, so a server
 connection keeps prepared statements created for a previous client, and a raw
 pool's cached statement name may collide with, or be missing from, whichever
 server connection it is next assigned.

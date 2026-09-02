@@ -32,23 +32,25 @@ instead, and so inherit pgx's default statement-caching exec mode:
 
 | PgBouncer setting | Result |
 |---|---|
-| default (`SHOW CONFIG` reports `max_prepared_statements = 200`) | every package passes in most runs, but **the default is not deterministic either**: `internal/ledger` failed 2 of 9 warm full-suite runs. It never failed in 8 runs of that package alone, so reproducing it needs the full parallel suite — consistent with the mechanism below |
-| `MAX_PREPARED_STATEMENTS=0`, pooler just started | **not** a clean pass. `internal/ledger`, `internal/lease`, `internal/orderedindex` and the root package (`TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss`) fail on a freshly started pooler too; only `internal/kv` and `internal/postgres` pass. Measured five ways: three `docker restart` cycles, a brand-new never-used container, and a fresh pooler run with `-p 1` |
+| default (`SHOW CONFIG` reports `max_prepared_statements = 200`) | every package passes in most runs, but **the default is not deterministic either**: `internal/ledger` failed 2 of 9 warm full-suite runs. It never failed in 8 runs of that package alone, so reproducing it needs the full parallel suite. The cause was not isolated: the error text was never captured, and eight targeted runs of that package plus three further full-suite runs all passed |
+| `MAX_PREPARED_STATEMENTS=0`, pooler just started | **not** a clean pass. `internal/ledger`, `internal/lease`, `internal/orderedindex` and the root package (`TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss`) fail on every one of six fresh-pooler runs: three `docker restart` cycles, a brand-new never-used container, a fresh pooler at `-p 1`, and a fresh pooler at default parallelism against a clean PostgreSQL 17. `internal/postgres` passes. `internal/kv` is the only package whose result moves with pooler warmth — it passed five of those six fresh runs; see below |
 | `MAX_PREPARED_STATEMENTS=0`, pooler with warm server connections | `internal/ledger`, `internal/lease`, `internal/orderedindex` **and `internal/kv`** fail; only `internal/postgres` passes; the root package fails only `TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss`, while the Ledger/KV/Leaser/OrderedIndex conformance tests, which obtain their store from `Open`, pass in every configuration |
 
 **Pooler warmth changes exactly one package: `internal/kv`.** The other four
 failures at `max_prepared_statements = 0` — `internal/ledger`, `internal/lease`,
 `internal/orderedindex` and the root migration test — occur on a freshly started
 pooler as well; an earlier revision of this table claimed a fresh pooler passed
-every package, and that was wrong. `internal/kv` alone flips: it passed 3/3 on a
-freshly started pooler and failed 3/3 on a reused one, because the outcome
-depends on whether a reused server connection still carries another client's
+every package, and that was wrong. `internal/kv` alone flips: in the restart
+experiment it passed 3/3 on the freshly started pooler and failed 3/3 on the
+reused one, because the outcome depends on whether a reused server connection still carries another client's
 prepared statements, which `server_reset_query_always=0` leaves in place in
-transaction mode. Parallel execution warms the pooler within a single otherwise
-fresh run, so `internal/kv` passes fresh at `-p 1` and fails fresh at the default
-parallelism; sequential execution does not rescue the other four, which still
-fail at `-p 1` on a fresh pooler. `docs/OPERATIONS.md` records the full pooler
-configuration and the reproduction command.
+transaction mode. Parallel execution can warm the pooler inside a single
+otherwise-fresh run, so a fresh pooler is not reliably cold at default
+parallelism: `internal/kv` passed four of five fresh runs at default parallelism
+and failed the fifth, and passed a fresh `-p 1` run. Running sequentially was
+tested as a rescue hypothesis for the other four and disproved — with `-p 1` on
+a fresh pooler the same four still fail. `docs/OPERATIONS.md` records the full
+pooler configuration and the reproduction command.
 
 PgBouncer has tracked and replayed named prepared statements in transaction
 mode since 1.21, so at the default configuration pgx's default exec mode
