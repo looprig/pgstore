@@ -13,6 +13,27 @@ PGSTORE_TEST_DSN=${PGSTORE_TEST_DSN:-}
 cache_dir="/private/tmp/pgstore-gocache-$$"
 completed=0
 
+# A cleanup handler has two jobs with different readiness requirements.
+# Restoration depends only on things that exist before the risky work starts, so
+# the trap must be installed early. Reporting depends on accumulators that do
+# not, so the window between installing the trap and initialising them is a hole
+# in exactly the reporting the trap was added to guarantee: an exit inside it
+# dereferenced $total under set -u and lost the ABORTED label. Both documented
+# ways in were real -- PGSTORE_MUTATION_RECOVER_ONLY=1, and a file listed in
+# $files renamed away at the prelude cp.
+#
+# These are initialised here, before the trap, so the window does not exist; and
+# finish still reads them defaulted, so adding an accumulator later cannot
+# reopen it.
+total=0
+killed=0
+failures=""
+# Terminal states this script has: a completed campaign, a completed recovery,
+# and an abort. Recovery is not a campaign that ran zero mutations -- it is its
+# own job, done in full -- so it needs its own label and its own exit status,
+# not the campaign epilogue's count check.
+mode=campaign
+
 # The epilogue must be unconditional. Two separate ways of dying before it were
 # measured -- a renamed test under set -e, and a DSN expanded under set -u --
 # and both ended the run with no summary, no class label, and in one case an
@@ -24,9 +45,13 @@ finish() {
 	restore_snapshot
 	rm -rf "$snapshot_dir"
 	rm -rf "$cache_dir"
-	if test "$completed" -ne 1; then
-		echo "ABORTED|the campaign exited before its epilogue after $total mutations; the results above are truncated and are not a pass"
+	if test "${completed:-0}" -ne 1; then
+		echo "ABORTED|the ${mode:-campaign} exited before its epilogue after ${total:-0} mutations; the results above are truncated and are not a pass"
 		exit 1
+	fi
+	if test "${mode:-campaign}" = recover; then
+		echo "RECOVERED|any prior snapshot was restored and removed; no mutations were run"
+		exit 0
 	fi
 	if test -n "${PGSTORE_MUTATION_EXPECTED_TOTAL:-}"; then
 		expected_total=$PGSTORE_MUTATION_EXPECTED_TOTAL
@@ -36,24 +61,24 @@ finish() {
 		expected_source="script default"
 	fi
 	if test -n "${PGSTORE_MUTATION_FILTER:-}"; then
-		echo "TOTAL=$total KILLED=$killed EXPECTED=(not checked: PGSTORE_MUTATION_FILTER=$PGSTORE_MUTATION_FILTER)"
-		if test "$total" -eq 0; then
+		echo "TOTAL=${total:-0} KILLED=${killed:-0} EXPECTED=(not checked: PGSTORE_MUTATION_FILTER=$PGSTORE_MUTATION_FILTER)"
+		if test "${total:-0}" -eq 0; then
 			echo "PGSTORE_MUTATION_FILTER=$PGSTORE_MUTATION_FILTER matched no entry; a run that measured nothing is not a pass"
 			exit 1
 		fi
 	else
-		echo "TOTAL=$total KILLED=$killed EXPECTED=$expected_total ($expected_source)"
+		echo "TOTAL=${total:-0} KILLED=${killed:-0} EXPECTED=$expected_total ($expected_source)"
 	fi
-	if test -n "$failures"; then
+	if test -n "${failures:-}"; then
 		echo "UNKILLED MUTATIONS:"
-		printf '%s' "$failures"
+		printf '%s' "${failures:-}"
 		exit 1
 	fi
-	if test -z "${PGSTORE_MUTATION_FILTER:-}" && test "$total" -ne "$expected_total"; then
-		echo "campaign ran $total mutations, want $expected_total ($expected_source): entries cannot be lost silently"
+	if test -z "${PGSTORE_MUTATION_FILTER:-}" && test "${total:-0}" -ne "$expected_total"; then
+		echo "campaign ran ${total:-0} mutations, want $expected_total ($expected_source): entries cannot be lost silently"
 		exit 1
 	fi
-	echo "ALL $killed MUTATIONS KILLED"
+	echo "ALL ${killed:-0} MUTATIONS KILLED"
 	exit 0
 }
 trap 'finish' EXIT INT TERM
@@ -75,6 +100,8 @@ if test -d "$snapshot_dir"; then
 fi
 
 if test "${PGSTORE_MUTATION_RECOVER_ONLY:-}" = 1; then
+	mode=recover
+	completed=1
 	exit 0
 fi
 
@@ -89,11 +116,8 @@ done
 # 35 of them, including all four OrderedIndex credential-leak mutations. A
 # mutation that cannot be classified is now recorded and the campaign continues,
 # so one stale string costs one mutation and is reported beside every other
-# result instead of truncating the evidence.
-total=0
-killed=0
-failures=""
-
+# result instead of truncating the evidence. The accumulators themselves are
+# initialised above, before the EXIT trap that reports them.
 record_failure() {
 	failures="$failures$1
 "
