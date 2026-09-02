@@ -49,8 +49,10 @@ requires a container you own and are willing to interrupt.
 shared container.** Restarting the database underneath a parallel run fails
 every other test that happens to be mid-query: measured, setting the variable
 for `go test -tags integration ./...` against one shared container turned a
-clean run into 38 unrelated failures, while the same suite without the variable
-and the gated test alone both pass. That interaction is why the test is gated
+clean run into dozens of unrelated failures — 38 in one measurement and 103 in
+another of the same configuration, because the count depends on which tests are
+mid-query when the restart lands — while the same suite without the variable and
+the gated test alone both pass. That interaction is why the test is gated
 rather than merely slow.
 
 No production SQL in this module is version-gated: the schema uses only
@@ -205,8 +207,9 @@ holds no server-session state to lose:
   inside row transactions, never by a session-held lock.
 
 **Measured** against `postgres:17` behind `edoburu/pgbouncer:v1.25.2-p0`. The
-exact configuration matters, because the result at
-`max_prepared_statements = 0` is not stable across runs:
+exact configuration matters, and neither setting below gives a deterministic
+result — the default flakes occasionally, and at `max_prepared_statements = 0`
+one package's outcome depends on the pooler's connection state:
 
 ```
 POOL_MODE=transaction  AUTH_TYPE=scram-sha-256  ADMIN_USERS=postgres
@@ -224,17 +227,25 @@ PGSTORE_TEST_DSN='postgres://…@127.0.0.1:56432/postgres?sslmode=disable'   GOW
 
 | Pooler setting | Result |
 |---|---|
-| default (`max_prepared_statements = 200`) | the **entire** integration suite passes, all six packages |
-| `MAX_PREPARED_STATEMENTS=0`, pooler just started | every package passes |
+| default (`max_prepared_statements = 200`) | all six packages pass in most runs, but **the default is not deterministic either**: `internal/ledger` failed 2 of 9 warm full-suite runs. It never failed in 8 runs of that package alone, so reproducing it needs the full parallel suite — consistent with the mechanism below |
+| `MAX_PREPARED_STATEMENTS=0`, pooler just started | **not** a clean pass. `internal/ledger`, `internal/lease`, `internal/orderedindex` and the root package (`TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss`) fail on a freshly started pooler too; only `internal/kv` and `internal/postgres` pass. Measured five ways: three `docker restart` cycles, a brand-new never-used container, and a fresh pooler run with `-p 1` |
 | `MAX_PREPARED_STATEMENTS=0`, pooler with warm server connections | `internal/ledger`, `internal/lease`, `internal/orderedindex` **and `internal/kv`** fail; only `internal/postgres` passes; the root package fails only `TestMigrationUpgradesImmediatelyPriorVersionWithoutDataLoss`, and the Ledger/KV/Leaser/OrderedIndex conformance tests pass in every configuration |
 
-**The pooler's own connection state, not test order, decides it.** Measured over
-three cycles, alternating a `docker restart` of the pooler with a rerun against
-the same one: `internal/kv` passed 3/3 on a freshly started pooler and failed
-3/3 on a reused one, and the two tests involved
+**Pooler warmth changes exactly one package: `internal/kv`.** The other four
+failures at `MAX_PREPARED_STATEMENTS=0` — `internal/ledger`, `internal/lease`,
+`internal/orderedindex` and the root migration test — are present on a freshly
+started pooler as well, so pooler freshness does not explain them. For
+`internal/kv` the pooler's own connection state, not test order, decides it:
+measured over three cycles alternating a `docker restart` of the pooler with a
+rerun against the same one, `internal/kv` passed 3/3 on a freshly started pooler
+and failed 3/3 on a reused one, and the two tests involved
 (`TestResolvePutAbsentProvesCanceledCreateDidNotCommit`,
 `TestPutAndDeleteResolveLostAcknowledgementsThroughPublicAPI`) behave the same
-way individually. The mechanism is `server_reset_query_always=0`: in transaction
+way individually. Parallel execution is enough to warm the pooler inside a
+single otherwise-fresh run: fresh plus `-p 1` passes `internal/kv`, fresh plus
+the default parallelism fails it. Running sequentially was tested as a rescue
+hypothesis for the other four and disproved — with `-p 1` on a fresh pooler the
+same four still fail. The mechanism is `server_reset_query_always=0`: in transaction
 mode PgBouncer does not run `DISCARD ALL` between clients, so a server
 connection keeps prepared statements created for a previous client, and a raw
 pool's cached statement name may collide with, or be missing from, whichever
@@ -243,7 +254,7 @@ server connection it is next assigned.
 **Read that table as a fact about the test harnesses, not about this module.**
 Those suites build their own pools with raw `pgxpool.New`, which bypasses the
 `Open` configuration above and inherits pgx's default statement-caching exec
-mode. They pass at the pooler's default because PgBouncer has tracked and
+mode. They mostly pass at the pooler's default because PgBouncer has tracked and
 replayed named prepared statements in transaction mode since 1.21 — that is,
 because the pooler compensates, not because the harnesses exercise what `Open`
 configures. The conformance tests, which obtain their store from `Open`, pass in
