@@ -5,6 +5,7 @@ package pgstore
 import (
 	"context"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -66,7 +67,14 @@ func TestMigrationAddsLeaseTable(t *testing.T) {
 		"CHECK ((revision >= 0))":                           true,
 		"CHECK (((holder IS NULL) = (expires_at IS NULL)))": true,
 	}
-	constraintRows, err := admin.Query(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'migrationlease.fresh_leases'::regclass`)
+	// contype 'n' is excluded because PostgreSQL 18 began recording NOT NULL
+	// constraints in pg_constraint, where earlier majors did not. That is a
+	// change in how the catalogue represents the schema, not in the schema, so
+	// an exact-set assertion over every pg_constraint row reported three extra
+	// entries on 18 for a table byte-identical to the one on 17. NOT NULL is
+	// asserted below from pg_attribute.attnotnull, which every supported major
+	// reports the same way -- and which nothing asserted at all before.
+	constraintRows, err := admin.Query(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'migrationlease.fresh_leases'::regclass AND contype <> 'n'`)
 	if err != nil {
 		t.Fatalf("query lease constraints: %v", err)
 	}
@@ -90,6 +98,27 @@ func TestMigrationAddsLeaseTable(t *testing.T) {
 			t.Fatalf("lease constraints = %v, missing %q", gotConstraints, definition)
 		}
 	}
+	wantNotNull := map[string]bool{"name": true, "epoch": true, "revision": true}
+	notNullRows, err := admin.Query(ctx, `SELECT attname FROM pg_attribute WHERE attrelid = 'migrationlease.fresh_leases'::regclass AND attnum > 0 AND NOT attisdropped AND attnotnull`)
+	if err != nil {
+		t.Fatalf("query lease NOT NULL columns: %v", err)
+	}
+	defer notNullRows.Close()
+	gotNotNull := make(map[string]bool)
+	for notNullRows.Next() {
+		var column string
+		if err := notNullRows.Scan(&column); err != nil {
+			t.Fatalf("scan lease NOT NULL column: %v", err)
+		}
+		gotNotNull[column] = true
+	}
+	if err := notNullRows.Err(); err != nil {
+		t.Fatalf("iterate lease NOT NULL columns: %v", err)
+	}
+	if !reflect.DeepEqual(gotNotNull, wantNotNull) {
+		t.Fatalf("lease NOT NULL columns = %v, want exactly %v; holder and expires_at are nullable together and must stay so", gotNotNull, wantNotNull)
+	}
+
 	var versions int
 	if err := admin.QueryRow(ctx, "SELECT count(*) FROM migrationlease.fresh_schema_migrations").Scan(&versions); err != nil {
 		t.Fatalf("count migration versions: %v", err)
