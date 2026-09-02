@@ -10,6 +10,14 @@ PostgreSQL. `Open` applies, validates, or bypasses schema version `0003`
 according to `Options.Migrations`; apply mode serializes owners under an
 explicit transaction-scoped migration lock.
 
+Supported PostgreSQL majors are **14, 15, 16, 17 and 18** — the versions inside
+the project's five-year support window — each verified by running the full
+integration suite against a disposable server of that major. See
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for the matrix and for the operator's
+contract: pool bounds, timeout scope, TLS, migration ownership, transaction-pool
+compatibility, backup and restore, and what this module deliberately does not
+provide.
+
 Leases retain one persistent row and monotonically increasing epoch per name.
 Each grant renews through ordinary pool operations and closes `Lost()` when
 ownership cannot be proved, including expiry, database outage, later-epoch
@@ -70,12 +78,26 @@ _ = structured
 
 Do not log `Options.DSN` when reporting an `Open` failure.
 
+Statement and lock timeouts are applied **per transaction**, not on the
+connection, so that they survive a transaction-pooling proxy. Single-statement
+paths — every `KV` operation, and the direct reads of the other primitives — are
+therefore bounded by the caller's context deadline rather than by a server-side
+`statement_timeout`. `docs/OPERATIONS.md` sets out what that does and does not
+guarantee.
+
+`pgstore` exposes no metrics, tracing, or logging of any kind. That is
+deliberate: the module must never emit a DSN or a credential, and the surest way
+to guarantee it is to have no logging path at all.
+
 ## Development
 
 ```sh
 make check
 GOWORK=off go test ./...
 ```
+
+Operational documentation lives in [`docs/OPERATIONS.md`](docs/OPERATIONS.md);
+known deferred work is in [`docs/FOLLOWUPS.md`](docs/FOLLOWUPS.md).
 
 The integration-tagged Storage conformance wiring reads `PGSTORE_TEST_DSN` and
 skips when it is absent; each test provisions its own uniquely prefixed schema
