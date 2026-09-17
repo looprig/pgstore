@@ -4,7 +4,7 @@ go 1.26.8
 
 require (
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/looprig/storage v0.6.0
+	github.com/looprig/storage v0.6.1
 )
 
 require (

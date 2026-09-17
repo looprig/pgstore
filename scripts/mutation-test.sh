@@ -286,9 +286,9 @@ run_mutation "Open deadline" pgstore.go 'guard.RequireDeadline(ctx, "Open")' 'gu
 run_mutation "pool error redaction" pgstore.go 'invalidOption("DSN", "PostgreSQL pool configuration was rejected")' 'invalidOption("DSN", "PostgreSQL pool configuration was rejected: "+err.Error())' TestOpenRedactsPoolConstructionError 'want non-unwrapping redacted error'
 run_mutation "nil Close" pgstore.go 'if s == nil {' 'if false && s == nil {' TestStoreCloseIsNilSafeAndIdempotent 'panic:'
 run_mutation "idempotent Close" pgstore.go 's.closeOnce.Do(s.closePool)' 's.closePool()' TestStoreCloseIsNilSafeAndIdempotent 'pool close calls = 2'
-run_mutation "local replace directive" go.mod 'go 1.26.6' 'go 1.26.6
+run_mutation "local replace directive" go.mod 'go 1.26.8' 'go 1.26.8
 
-replace github.com/looprig/storage => github.com/looprig/storage v0.6.0' TestDependencyBoundary 'go.mod has 1 replace directives, want none'
+replace github.com/looprig/storage => github.com/looprig/storage v0.6.1' TestDependencyBoundary 'go.mod has 1 replace directives, want none'
 run_mutation "extra direct module" go.mod 'github.com/jackc/puddle/v2 v2.2.2 // indirect' 'github.com/jackc/puddle/v2 v2.2.2' TestDependencyBoundary 'direct modules ='
 run_mutation "logging import" pgstore.go '"context"' '"context"
 	_ "log/slog"' TestDependencyBoundary 'imports logging package "log/slog"'
