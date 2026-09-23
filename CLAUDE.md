@@ -26,7 +26,13 @@ migration framework, logging framework, SessionStore, or S3 SDK is allowed.
   error or log. This module does not log credentials at any level.
 - Production connections require verified TLS. Plaintext is accepted only for
   an explicitly enabled loopback test database.
-- Every operation, including Open, requires a caller context deadline.
+- Every operation, including Open, runs under a deadline: the caller's if it
+  has one (always, even when longer), else `Options.DefaultOperationTimeout`
+  (30s default) applied by `guard.Bound` as a child of the caller's context.
+  The Storage contract does not require callers to supply one, so refusing an
+  undated context (v0.1.x) is not an option; a nil context is still refused.
+  `TestStructuredOperationMethodsCallDeadlineGuard` requires every operation to
+  call `guard.Bound`, and the hung-server tests hold the bound itself.
 - Transactions classify PostgreSQL errors by typed/code fields, never strings.
 - Migrations are monotonic and serialized by an explicit database lock.
 - Do not use PostgreSQL advisory locks for leases or for any primitive

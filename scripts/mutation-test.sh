@@ -69,7 +69,7 @@ finish() {
 		expected_total=$PGSTORE_MUTATION_EXPECTED_TOTAL
 		expected_source="PGSTORE_MUTATION_EXPECTED_TOTAL from the environment"
 	else
-		expected_total=154
+		expected_total=167
 		expected_source="script default"
 	fi
 	if test -n "${PGSTORE_MUTATION_FILTER:-}"; then
@@ -280,9 +280,13 @@ run_mutation "transaction-pool query mode" options.go 'poolConfig.ConnConfig.Def
 run_mutation "transaction-pool startup parameter" options.go 'delete(poolConfig.ConnConfig.RuntimeParams, "statement_timeout")' 'poolConfig.ConnConfig.RuntimeParams["statement_timeout"] = "1"' TestOptionsResolveAppliesValidCustomValues 'statement_timeout is a startup RuntimeParam'
 run_mutation "migration enum" options.go 'if o.Migrations > MigrationDisabled {' 'if false && o.Migrations > MigrationDisabled {' TestOptionsResolve 'invalid_migration_mode'
 run_mutation "nil context" internal/guard/guard.go 'if ctx == nil {' 'if false && ctx == nil {' TestOperationRejectsNilContext 'panic:'
-run_mutation "context deadline" internal/guard/guard.go 'if _, ok := ctx.Deadline(); !ok {' 'if _, ok := ctx.Deadline(); ok && false {' TestOpenRequiresDeadline 'want *DeadlineRequiredError'
+run_mutation "caller deadline wins" internal/guard/guard.go '	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}, nil
+	}' '' TestCallerDeadlineWinsOverTheDefault 'overrode the caller'
+run_mutation "default bound applied" internal/guard/guard.go 'bounded, cancel := context.WithTimeout(ctx, timeout)' 'bounded, cancel := context.WithCancel(ctx)' TestOpenWithoutDeadlineIsBounded 'Open did not return within'
+run_mutation "default operation timeout" options.go 'resolveTimeout("DefaultOperationTimeout", o.DefaultOperationTimeout, DefaultOperationTimeout)' 'resolveTimeout("DefaultOperationTimeout", o.DefaultOperationTimeout, time.Hour)' TestDefaultOperationTimeoutOption 'want the documented 30s'
 run_mutation "Open option short circuit" pgstore.go 'if err != nil {' 'if false && err != nil {' TestOpenRejectsOptionsBeforePoolConstruction 'panic:'
-run_mutation "Open deadline" pgstore.go 'guard.RequireDeadline(ctx, "Open")' 'guard.NotImplemented("Open")' TestOpenRequiresDeadline 'want *DeadlineRequiredError'
+run_mutation "Open default bound" pgstore.go 'ctx, cancel, err := guard.Bound(ctx, "Open", resolved.operationTimeout)' 'ctx, cancel, err := ctx, context.CancelFunc(func() {}), error(nil)' TestOpenWithoutDeadlineIsBounded 'Open did not return within'
 run_mutation "pool error redaction" pgstore.go 'invalidOption("DSN", "PostgreSQL pool configuration was rejected")' 'invalidOption("DSN", "PostgreSQL pool configuration was rejected: "+err.Error())' TestOpenRedactsPoolConstructionError 'want non-unwrapping redacted error'
 run_mutation "nil Close" pgstore.go 'if s == nil {' 'if false && s == nil {' TestStoreCloseIsNilSafeAndIdempotent 'panic:'
 run_mutation "idempotent Close" pgstore.go 's.closeOnce.Do(s.closePool)' 's.closePool()' TestStoreCloseIsNilSafeAndIdempotent 'pool close calls = 2'
@@ -295,7 +299,7 @@ run_mutation "logging import" pgstore.go '"context"' '"context"
 run_mutation "Blobs field" pgstore.go 'Ledger       storage.Ledger' 'Blobs        storage.Blobs
 	Ledger       storage.Ledger' TestOpenWiresStructuredPrimitivesWithoutBlobs 'Store exposes a Blobs field'
 
-for operation in Leaser.Acquire Lease.Release OrderedIndex.Get OrderedIndex.Create OrderedIndex.Update OrderedIndex.Delete OrderedIndex.ListOrdered OrderedIndex.ListRanked OrderedIndex.ListDue; do
+for operation in KV.Get KV.Put KV.Keys KV.Delete Ledger.Append Ledger.Read Ledger.Tip Ledger.Delete Leaser.Acquire OrderedIndex.Get OrderedIndex.Create OrderedIndex.Update OrderedIndex.Delete OrderedIndex.ListOrdered OrderedIndex.ListRanked OrderedIndex.ListDue; do
 	case $operation in
 		Ledger.*) file=internal/ledger/ledger.go ;;
 		Leaser.*) file=internal/lease/lease.go ;;
@@ -303,8 +307,17 @@ for operation in Leaser.Acquire Lease.Release OrderedIndex.Get OrderedIndex.Crea
 		KV.*) file=internal/kv/kv.go ;;
 		OrderedIndex.*) file=internal/orderedindex/orderedindex.go ;;
 	esac
-	run_mutation "$operation deadline call" "$file" "guard.RequireDeadline(ctx, \"$operation\")" "guard.NotImplemented(\"$operation\")" TestStructuredOperationMethodsCallDeadlineGuard 'does not call guard.RequireDeadline'
+	run_mutation "$operation default bound" "$file" "guard.Bound(ctx, \"$operation\", s.operationTimeout)" "guard.Bound(ctx, \"$operation\", 1<<62)" TestHungDatabaseOperationsReturnWithinTheDefaultBound "$operation did not return within"
 done
+
+# D2: Open hands the configured bound to every primitive.
+run_mutation "KV timeout wiring" pgstore.go 'kv.New(pool, resolved.schema, resolved.tablePrefix).WithOperationTimeout(resolved.operationTimeout)' 'kv.New(pool, resolved.schema, resolved.tablePrefix)' TestHungDatabaseOperationsReturnWithinTheDefaultBound 'KV.Get did not return within'
+run_mutation "Ledger timeout wiring" pgstore.go 'resolved.lockTimeout).WithOperationTimeout(resolved.operationTimeout),
+		Leaser:' 'resolved.lockTimeout),
+		Leaser:' TestHungDatabaseOperationsReturnWithinTheDefaultBound 'Ledger.Read did not return within'
+run_mutation "OrderedIndex timeout wiring" pgstore.go 'orderedindex.New(pool, resolved.schema, resolved.tablePrefix, resolved.statementTimeout, resolved.lockTimeout).WithOperationTimeout(resolved.operationTimeout)' 'orderedindex.New(pool, resolved.schema, resolved.tablePrefix, resolved.statementTimeout, resolved.lockTimeout)' TestHungDatabaseOperationsReturnWithinTheDefaultBound 'OrderedIndex.Get did not return within'
+run_mutation "Leaser timeout wiring" pgstore.go '.
+		WithOperationTimeout(resolved.operationTimeout)' '' TestHungDatabaseOperationsReturnWithinTheDefaultBound 'Leaser.Acquire did not return within'
 
 run_mutation "retry SQLSTATE classification" internal/postgres/postgres.go 'pgErr.Code == "40001"' 'pgErr.Code == "40002"' TestRetryableClassifiesOnlySerializationAndDeadlockSQLStates 'Retryable(SQLSTATE 40001) = false, want true'
 run_mutation "lease advisory lock prohibited" internal/lease/lease.go 'const holderTokenBytes = 32' 'const holderTokenBytes = 32

@@ -51,8 +51,23 @@ explicitly enabled loopback test database. Pool minimum/maximum connections,
 schema, table prefix, statement timeout, lock timeout, lease TTL, renewal
 interval, and migration policy are validated before the pool is created. The
 pool disables connection-local prepared-statement caching; lock-taking
-transactions apply timeouts with transaction-local settings. Every call
-requires a caller-owned context deadline.
+transactions apply timeouts with transaction-local settings.
+
+### Default operation timeout
+
+The Storage contract does not require a caller to put a deadline on its
+context, and SessionStore's consumers do not (Host opens its store on
+`context.WithoutCancel`). v0.1.x refused every such call with
+`DeadlineRequiredError`, so no Host could run on this backend. This release
+bounds it instead: `Open` and every Ledger, Leaser, `Lease.Release`, KV, and
+OrderedIndex operation runs under `Options.DefaultOperationTimeout` (default
+`DefaultOperationTimeout`, 30s) when the context has no deadline. A caller's own
+deadline always wins, shorter or longer; the default is a child of the caller's
+context, so cancellation is still honoured; and a nil context is still refused
+with `DeadlineRequiredError`. The reason a deadline was required still holds and
+the default satisfies it: statements outside a transaction carry no server-side
+timeout, so the context deadline, which pgx turns into query cancellation, is
+the only bound on them (`docs/OPERATIONS.md`).
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -82,7 +97,8 @@ Statement and lock timeouts are applied **per transaction**, not on the
 connection, so that they survive a transaction-pooling proxy. Paths that run
 outside a transaction — every `KV` operation, the direct reads of the other
 primitives, and `Ledger.Delete`, which is a write — are therefore bounded by the
-caller's context deadline rather than by a server-side `statement_timeout`. A
+caller's context deadline (or the default operation timeout when it has none)
+rather than by a server-side `statement_timeout`. A
 `statement_timeout` supplied in the DSN is removed for the same reason, without
 an error. `docs/OPERATIONS.md` sets out what that does and does not guarantee,
 with measurements.

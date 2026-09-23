@@ -120,10 +120,16 @@ The consequences, stated plainly because they are easy to assume away:
   `LockTimeout`. At the default `MaxConns` of 10 that is a pool-exhaustion
   vector, so give `Ledger.Delete` a context deadline you would be willing to
   spend a connection on.
-- Those paths are bounded by the caller's context deadline, which pgx turns into
-  query cancellation. Every operation, including `Open`, requires such a
-  deadline and returns `DeadlineRequiredError` without one — so they are
-  bounded, but by the caller rather than by the database.
+- Those paths are bounded by the context deadline, which pgx turns into query
+  cancellation. When the caller supplies none, every operation, including
+  `Open`, applies `Options.DefaultOperationTimeout` (30s by default) instead —
+  so they are always bounded, but by the client rather than by the database.
+  v0.1.x refused an undated context with `DeadlineRequiredError`; the Storage
+  contract never required one, so that refusal made pgstore unusable under
+  callers such as Host that open their store on `context.WithoutCancel`. A
+  caller's own deadline always wins, including one longer than the default.
+  Size the default with `Ledger.Delete` above in mind: an undated
+  `Ledger.Delete` can hold a pool connection for the whole default.
 - **The ambiguity-resolution reads are the exception, and are bounded
   internally.** After a lost acknowledgement, `resolveAppend`, `resolveDelete`,
   `resolvePut`, `resolveDelete` (KV), `resolveAcquire`, `resolveRelease`,
@@ -372,7 +378,8 @@ module cannot detect the situation for you.
 **There are none, and none are planned by this module.** `pgstore` exposes no
 metrics, no tracing, no callbacks and no logging of any kind. The entire
 exported surface is `Open`, `Store`, `Options`, `OptionsError`, `MigrationMode`,
-and the `DeadlineRequiredError` / `NotImplementedError` aliases.
+the `DefaultOperationTimeout` constant, and the `DeadlineRequiredError` /
+`NotImplementedError` aliases (`DeadlineRequiredError` now means a nil context).
 
 This is deliberate rather than unfinished: the module never logs, because the
 one thing it must never emit is a DSN or a credential, and the simplest way to
