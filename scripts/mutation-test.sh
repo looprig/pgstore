@@ -69,7 +69,7 @@ finish() {
 		expected_total=$PGSTORE_MUTATION_EXPECTED_TOTAL
 		expected_source="PGSTORE_MUTATION_EXPECTED_TOTAL from the environment"
 	else
-		expected_total=167
+		expected_total=185
 		expected_source="script default"
 	fi
 	if test -n "${PGSTORE_MUTATION_FILTER:-}"; then
@@ -500,5 +500,163 @@ run_integration_mutation "kv keys leaks DSN" internal/kv/kv.go 'return nil, fail
 run_integration_mutation "kv put resolution leaks DSN" internal/kv/kv.go 'return 0, pginternal.RedactedError("kv put outcome resolution")' "return 0, pginternal.RedactedError(\"kv put outcome resolution on ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Put error disclosed'
 run_integration_mutation "kv delete resolution leaks DSN" internal/kv/kv.go 'return pginternal.RedactedError("kv delete outcome resolution")' "return pginternal.RedactedError(\"kv delete outcome resolution on ${PGSTORE_TEST_DSN}\")" TestOperationErrorsDoNotDiscloseDSNOrCredential 'KV.Delete error disclosed'
 run_integration_mutation "migration failure leaks DSN" migrations.go 'return pginternal.RedactedError("schema migration")' "return errors.New(\"schema migration failed: ${PGSTORE_TEST_DSN}\")" TestMigrationErrorsDoNotDiscloseDSNOrCredential 'error disclosed'
+
+# D2 follow-up: Lease.Release's bound (unreachable against a hung server) and
+# the release of every bound (leak class: a dropped cancel only shows when its
+# timer fires, so only the opaque-parent goroutine count sees it).
+run_integration_mutation "Lease.Release default bound" internal/lease/lease.go 'guard.Bound(ctx, "Lease.Release", l.store.operationTimeout)' 'guard.Bound(ctx, "Lease.Release", 1<<62)' TestLeaseReleaseIsBoundedByTheDefault 'Release did not return within the default bound'
+run_integration_mutation "KV.Get releases bound" internal/kv/kv.go '	ctx, cancel, err := guard.Bound(ctx, "KV.Get", s.operationTimeout)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "KV.Get", s.operationTimeout)
+	if err != nil {
+		return nil, 0, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "KV.Put releases bound" internal/kv/kv.go '	ctx, cancel, err := guard.Bound(ctx, "KV.Put", s.operationTimeout)
+	if err != nil {
+		return 0, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "KV.Put", s.operationTimeout)
+	if err != nil {
+		return 0, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "KV.Keys releases bound" internal/kv/kv.go '	ctx, cancel, err := guard.Bound(ctx, "KV.Keys", s.operationTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "KV.Keys", s.operationTimeout)
+	if err != nil {
+		return nil, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "KV.Delete releases bound" internal/kv/kv.go '	ctx, cancel, err := guard.Bound(ctx, "KV.Delete", s.operationTimeout)
+	if err != nil {
+		return err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "KV.Delete", s.operationTimeout)
+	if err != nil {
+		return err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "Ledger.Append releases bound" internal/ledger/ledger.go '	ctx, cancel, err := guard.Bound(ctx, "Ledger.Append", s.operationTimeout)
+	if err != nil {
+		return err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "Ledger.Append", s.operationTimeout)
+	if err != nil {
+		return err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "Ledger.Read releases bound" internal/ledger/ledger.go '	ctx, cancel, err := guard.Bound(ctx, "Ledger.Read", s.operationTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "Ledger.Read", s.operationTimeout)
+	if err != nil {
+		return nil, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "Ledger.Tip releases bound" internal/ledger/ledger.go '	ctx, cancel, err := guard.Bound(ctx, "Ledger.Tip", s.operationTimeout)
+	if err != nil {
+		return 0, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "Ledger.Tip", s.operationTimeout)
+	if err != nil {
+		return 0, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "Ledger.Delete releases bound" internal/ledger/ledger.go '	ctx, cancel, err := guard.Bound(ctx, "Ledger.Delete", s.operationTimeout)
+	if err != nil {
+		return err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "Ledger.Delete", s.operationTimeout)
+	if err != nil {
+		return err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "Leaser.Acquire releases bound" internal/lease/lease.go '	ctx, cancel, err := guard.Bound(ctx, "Leaser.Acquire", s.operationTimeout)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "Leaser.Acquire", s.operationTimeout)
+	if err != nil {
+		return nil, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "Lease.Release releases bound" internal/lease/lease.go '	ctx, cancel, err := guard.Bound(ctx, "Lease.Release", l.store.operationTimeout)
+	if err != nil {
+		return err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "Lease.Release", l.store.operationTimeout)
+	if err != nil {
+		return err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "OrderedIndex.Get releases bound" internal/orderedindex/orderedindex.go '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.Get", s.operationTimeout)
+	if err != nil {
+		return storage.OrderedRecord{}, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.Get", s.operationTimeout)
+	if err != nil {
+		return storage.OrderedRecord{}, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "OrderedIndex.Create releases bound" internal/orderedindex/orderedindex.go '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.Create", s.operationTimeout)
+	if err != nil {
+		return storage.OrderedRecord{}, false, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.Create", s.operationTimeout)
+	if err != nil {
+		return storage.OrderedRecord{}, false, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "OrderedIndex.Update releases bound" internal/orderedindex/orderedindex.go '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.Update", s.operationTimeout)
+	if err != nil {
+		return storage.OrderedRecord{}, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.Update", s.operationTimeout)
+	if err != nil {
+		return storage.OrderedRecord{}, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "OrderedIndex.Delete releases bound" internal/orderedindex/orderedindex.go '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.Delete", s.operationTimeout)
+	if err != nil {
+		return storage.OrderedRecord{}, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.Delete", s.operationTimeout)
+	if err != nil {
+		return storage.OrderedRecord{}, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "OrderedIndex.ListOrdered releases bound" internal/orderedindex/orderedindex.go '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.ListOrdered", s.operationTimeout)
+	if err != nil {
+		return storage.OrderedPage{}, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.ListOrdered", s.operationTimeout)
+	if err != nil {
+		return storage.OrderedPage{}, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "OrderedIndex.ListRanked releases bound" internal/orderedindex/orderedindex.go '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.ListRanked", s.operationTimeout)
+	if err != nil {
+		return storage.RankedPage{}, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.ListRanked", s.operationTimeout)
+	if err != nil {
+		return storage.RankedPage{}, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
+run_integration_mutation "OrderedIndex.ListDue releases bound" internal/orderedindex/orderedindex.go '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.ListDue", s.operationTimeout)
+	if err != nil {
+		return storage.DuePage{}, err
+	}
+	defer cancel()' '	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.ListDue", s.operationTimeout)
+	if err != nil {
+		return storage.DuePage{}, err
+	}
+	_ = cancel' TestDefaultBoundIsReleasedAfterEveryOperation 'a default bound was not released'
 
 completed=1
