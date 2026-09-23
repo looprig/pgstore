@@ -12,20 +12,6 @@ import (
 	"github.com/looprig/storage"
 )
 
-func TestOpenRequiresDeadline(t *testing.T) {
-	t.Parallel()
-
-	store, err := Open(context.Background(), Options{DSN: testDSN})
-	if store != nil {
-		store.Close()
-		t.Fatal("Open returned a Store without a caller deadline")
-	}
-	var deadlineErr *DeadlineRequiredError
-	if !errors.As(err, &deadlineErr) {
-		t.Fatalf("Open error = %T %v, want *DeadlineRequiredError", err, err)
-	}
-}
-
 func TestOperationRejectsNilContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -117,26 +103,5 @@ func TestOpenWiresStructuredPrimitivesWithoutBlobs(t *testing.T) {
 	}
 	if _, implements := any(store).(storage.Blobs); implements {
 		t.Fatal("Store implements storage.Blobs; blob storage belongs to s3store")
-	}
-}
-
-func TestOperationRequiresCallerDeadlineBeforeStubResult(t *testing.T) {
-	t.Parallel()
-
-	openCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	store, err := Open(openCtx, Options{DSN: testDSN, Migrations: MigrationDisabled})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(store.Close)
-
-	err = store.Ledger.Append(context.Background(), "sessions/deadline", 0, nil)
-	var deadlineErr *DeadlineRequiredError
-	if !errors.As(err, &deadlineErr) {
-		t.Fatalf("Append error = %T %v, want *DeadlineRequiredError", err, err)
-	}
-	if deadlineErr.Operation != "Ledger.Append" {
-		t.Errorf("DeadlineRequiredError.Operation = %q, want %q", deadlineErr.Operation, "Ledger.Append")
 	}
 }

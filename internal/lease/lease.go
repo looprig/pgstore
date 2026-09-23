@@ -19,6 +19,7 @@ import (
 const holderTokenBytes = 32
 
 type Store struct {
+	operationTimeout time.Duration
 	pool             *pgxpool.Pool
 	schema           string
 	tablePrefix      string
@@ -42,7 +43,7 @@ func New(pool *pgxpool.Pool, schema, tablePrefix string, leaseTTL, renewInterval
 	if len(operationTimeouts) == 2 {
 		statementTimeout, lockTimeout = operationTimeouts[0], operationTimeouts[1]
 	}
-	store := &Store{
+	store := &Store{operationTimeout: guard.DefaultOperationTimeout,
 		pool: pool, schema: schema, tablePrefix: tablePrefix,
 		leaseTTL: leaseTTL, renewInterval: renewInterval,
 		statementTimeout: statementTimeout, lockTimeout: lockTimeout,
@@ -52,6 +53,13 @@ func New(pool *pgxpool.Pool, schema, tablePrefix string, leaseTTL, renewInterval
 	store.commit = func(ctx context.Context, tx pgx.Tx) error { return tx.Commit(ctx) }
 	store.release = store.releaseRow
 	return store
+}
+
+// WithOperationTimeout sets the bound applied to an operation whose context
+// has no deadline. It must be called before the Store is shared.
+func (s *Store) WithOperationTimeout(timeout time.Duration) *Store {
+	s.operationTimeout = timeout
+	return s
 }
 
 type renewal struct {
@@ -95,9 +103,11 @@ func (s *Store) releaseRow(ctx context.Context, lease *Lease) error {
 }
 
 func (s *Store) Acquire(ctx context.Context, name string) (storage.Lease, error) {
-	if err := guard.RequireDeadline(ctx, "Leaser.Acquire"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "Leaser.Acquire", s.operationTimeout)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	if err := storage.ValidateName(name); err != nil {
 		return nil, err
 	}
@@ -205,9 +215,11 @@ func (l *Lease) Epoch() uint64 {
 func (l *Lease) Lost() <-chan struct{} { return l.lost }
 
 func (l *Lease) Release(ctx context.Context) error {
-	if err := guard.RequireDeadline(ctx, "Lease.Release"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "Lease.Release", l.store.operationTimeout)
+	if err != nil {
 		return err
 	}
+	defer cancel()
 	l.releaseMu.Lock()
 	defer l.releaseMu.Unlock()
 	l.mu.Lock()
@@ -226,7 +238,7 @@ func (l *Lease) Release(ctx context.Context) error {
 		l.store.unregister(l)
 	}
 
-	err := l.store.release(ctx, l)
+	err = l.store.release(ctx, l)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr

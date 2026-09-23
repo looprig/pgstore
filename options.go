@@ -62,6 +62,17 @@ type Options struct {
 
 	Migrations MigrationMode
 
+	// DefaultOperationTimeout bounds every call (Open and each Ledger,
+	// Leaser, Lease.Release, KV, and OrderedIndex operation) whose context
+	// has no deadline. The Storage contract does not require callers to
+	// supply one, so the Store supplies it: statements outside a transaction
+	// carry no server-side statement_timeout (see docs/OPERATIONS.md), and
+	// the context deadline is what pgx turns into query cancellation. A
+	// caller's own deadline always wins, shorter or longer, and cancellation
+	// of the caller's context is honoured either way. Zero selects the 30s
+	// DefaultOperationTimeout; a negative or sub-millisecond value is rejected.
+	DefaultOperationTimeout time.Duration
+
 	// AllowInsecureLocalhostOnly permits sslmode=disable only when pgx resolves
 	// the target as a loopback host. It exists for disposable local test databases.
 	AllowInsecureLocalhostOnly bool
@@ -89,6 +100,7 @@ type resolvedOptions struct {
 	leaseTTL           time.Duration
 	leaseRenewInterval time.Duration
 	migrations         MigrationMode
+	operationTimeout   time.Duration
 }
 
 func (o Options) resolve() (resolvedOptions, error) {
@@ -154,6 +166,10 @@ func (o Options) resolve() (resolvedOptions, error) {
 	if leaseRenewInterval >= leaseTTL {
 		return resolvedOptions{}, invalidOption("LeaseRenewInterval", "must be shorter than LeaseTTL")
 	}
+	operationTimeout, err := resolveTimeout("DefaultOperationTimeout", o.DefaultOperationTimeout, DefaultOperationTimeout)
+	if err != nil {
+		return resolvedOptions{}, err
+	}
 	if o.Migrations > MigrationDisabled {
 		return resolvedOptions{}, invalidOption("Migrations", "has an unknown mode")
 	}
@@ -174,7 +190,7 @@ func (o Options) resolve() (resolvedOptions, error) {
 		schema: schema, tablePrefix: tablePrefix,
 		statementTimeout: statementTimeout, lockTimeout: lockTimeout,
 		leaseTTL: leaseTTL, leaseRenewInterval: leaseRenewInterval,
-		migrations: o.Migrations,
+		migrations: o.Migrations, operationTimeout: operationTimeout,
 	}, nil
 }
 

@@ -16,6 +16,7 @@ import (
 )
 
 type Store struct {
+	operationTimeout time.Duration
 	pool             *pgxpool.Pool
 	schema           string
 	tablePrefix      string
@@ -31,16 +32,25 @@ func New(pool *pgxpool.Pool, schema, tablePrefix string, operationTimeouts ...ti
 	if len(operationTimeouts) == 2 {
 		statementTimeout, lockTimeout = operationTimeouts[0], operationTimeouts[1]
 	}
-	store := &Store{pool: pool, schema: schema, tablePrefix: tablePrefix, statementTimeout: statementTimeout, lockTimeout: lockTimeout, commit: func(ctx context.Context, tx pgx.Tx) error { return tx.Commit(ctx) }}
+	store := &Store{operationTimeout: guard.DefaultOperationTimeout, pool: pool, schema: schema, tablePrefix: tablePrefix, statementTimeout: statementTimeout, lockTimeout: lockTimeout, commit: func(ctx context.Context, tx pgx.Tx) error { return tx.Commit(ctx) }}
 	store.attempt = store.appendOnce
 	store.delete = store.deleteOnce
 	return store
 }
 
+// WithOperationTimeout sets the bound applied to an operation whose context
+// has no deadline. It must be called before the Store is shared.
+func (s *Store) WithOperationTimeout(timeout time.Duration) *Store {
+	s.operationTimeout = timeout
+	return s
+}
+
 func (s *Store) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
-	if err := guard.RequireDeadline(ctx, "Ledger.Append"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "Ledger.Append", s.operationTimeout)
+	if err != nil {
 		return err
 	}
+	defer cancel()
 	if err := storage.ValidateName(name); err != nil {
 		return err
 	}
@@ -141,9 +151,11 @@ func (s *Store) resolveAppend(ctx context.Context, name string, expected uint64,
 }
 
 func (s *Store) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
-	if err := guard.RequireDeadline(ctx, "Ledger.Read"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "Ledger.Read", s.operationTimeout)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	if err := storage.ValidateName(name); err != nil {
 		return nil, err
 	}
@@ -166,18 +178,20 @@ func (s *Store) Read(ctx context.Context, name string, from uint64) (storage.Cur
 	if rows.Err() != nil {
 		return nil, operationFailure(ctx, "ledger read")
 	}
-	return &cursor{records: records}, nil
+	return &cursor{records: records, operationTimeout: s.operationTimeout}, nil
 }
 
 func (s *Store) Tip(ctx context.Context, name string) (uint64, error) {
-	if err := guard.RequireDeadline(ctx, "Ledger.Tip"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "Ledger.Tip", s.operationTimeout)
+	if err != nil {
 		return 0, err
 	}
+	defer cancel()
 	if err := storage.ValidateName(name); err != nil {
 		return 0, err
 	}
 	var tip uint64
-	err := s.pool.QueryRow(ctx, "SELECT tip FROM "+pginternal.Qualified(s.schema, s.tablePrefix+"ledger_scopes")+" WHERE name = $1", name).Scan(&tip)
+	err = s.pool.QueryRow(ctx, "SELECT tip FROM "+pginternal.Qualified(s.schema, s.tablePrefix+"ledger_scopes")+" WHERE name = $1", name).Scan(&tip)
 	if err == pgx.ErrNoRows {
 		return 0, nil
 	}
@@ -188,9 +202,11 @@ func (s *Store) Tip(ctx context.Context, name string) (uint64, error) {
 }
 
 func (s *Store) Delete(ctx context.Context, name string) error {
-	if err := guard.RequireDeadline(ctx, "Ledger.Delete"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "Ledger.Delete", s.operationTimeout)
+	if err != nil {
 		return err
 	}
+	defer cancel()
 	if err := storage.ValidateName(name); err != nil {
 		return err
 	}
@@ -227,15 +243,20 @@ func safeCause(ctx context.Context, operation string) error {
 }
 
 type cursor struct {
-	records  []storage.Record
-	position int
-	closed   bool
+	operationTimeout time.Duration
+	records          []storage.Record
+	position         int
+	closed           bool
 }
 
 func (c *cursor) Next(ctx context.Context) (storage.Record, error) {
-	if err := guard.RequireDeadline(ctx, "Ledger.Cursor.Next"); err != nil {
+	// Next serves already-fetched records and does no I/O; the call keeps the
+	// uniform nil-context refusal every operation has.
+	_, cancel, err := guard.Bound(ctx, "Ledger.Cursor.Next", c.operationTimeout)
+	if err != nil {
 		return storage.Record{}, err
 	}
+	defer cancel()
 	if c.closed || c.position >= len(c.records) {
 		return storage.Record{}, io.EOF
 	}

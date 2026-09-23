@@ -4,6 +4,7 @@ package kv
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -13,6 +14,7 @@ import (
 )
 
 type Store struct {
+	operationTimeout    time.Duration
 	pool                *pgxpool.Pool
 	schema, tablePrefix string
 	put                 func(context.Context, string, uint64, []byte) (uint64, error)
@@ -20,22 +22,31 @@ type Store struct {
 }
 
 func New(pool *pgxpool.Pool, schema, tablePrefix string) *Store {
-	store := &Store{pool: pool, schema: schema, tablePrefix: tablePrefix}
+	store := &Store{operationTimeout: guard.DefaultOperationTimeout, pool: pool, schema: schema, tablePrefix: tablePrefix}
 	store.put = store.putOnce
 	store.delete = store.deleteOnce
 	return store
 }
 
+// WithOperationTimeout sets the bound applied to an operation whose context
+// has no deadline. It must be called before the Store is shared.
+func (s *Store) WithOperationTimeout(timeout time.Duration) *Store {
+	s.operationTimeout = timeout
+	return s
+}
+
 func (s *Store) Get(ctx context.Context, key string) ([]byte, uint64, error) {
-	if err := guard.RequireDeadline(ctx, "KV.Get"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "KV.Get", s.operationTimeout)
+	if err != nil {
 		return nil, 0, err
 	}
+	defer cancel()
 	if err := storage.ValidateName(key); err != nil {
 		return nil, 0, err
 	}
 	var value []byte
 	var revision uint64
-	err := s.pool.QueryRow(ctx, "SELECT value, revision FROM "+s.table()+" WHERE key = $1", key).Scan(&value, &revision)
+	err = s.pool.QueryRow(ctx, "SELECT value, revision FROM "+s.table()+" WHERE key = $1", key).Scan(&value, &revision)
 	if err == pgx.ErrNoRows {
 		return nil, 0, &storage.KeyNotFoundError{Key: key}
 	}
@@ -46,9 +57,11 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, uint64, error) {
 }
 
 func (s *Store) Put(ctx context.Context, key string, expected uint64, value []byte) (uint64, error) {
-	if err := guard.RequireDeadline(ctx, "KV.Put"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "KV.Put", s.operationTimeout)
+	if err != nil {
 		return 0, err
 	}
+	defer cancel()
 	if err := storage.ValidateName(key); err != nil {
 		return 0, err
 	}
@@ -77,9 +90,11 @@ func (s *Store) putOnce(ctx context.Context, key string, expected uint64, value 
 }
 
 func (s *Store) Keys(ctx context.Context, prefix string) ([]string, error) {
-	if err := guard.RequireDeadline(ctx, "KV.Keys"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "KV.Keys", s.operationTimeout)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	rows, err := s.pool.Query(ctx, "SELECT key FROM "+s.table()+" WHERE left(key, length($1)) = $1 ORDER BY key COLLATE \"C\"", prefix)
 	if err != nil {
 		return nil, failure(ctx, "kv keys")
@@ -100,9 +115,11 @@ func (s *Store) Keys(ctx context.Context, prefix string) ([]string, error) {
 }
 
 func (s *Store) Delete(ctx context.Context, key string) error {
-	if err := guard.RequireDeadline(ctx, "KV.Delete"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "KV.Delete", s.operationTimeout)
+	if err != nil {
 		return err
 	}
+	defer cancel()
 	if err := storage.ValidateName(key); err != nil {
 		return err
 	}

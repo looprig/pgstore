@@ -14,7 +14,7 @@ import (
 
 // TestStructuredOperationMethodsCallDeadlineGuard derives the operation set
 // from production source. Every exported method whose first argument is a
-// context must call guard.RequireDeadline, so a newly added operation cannot
+// context must call guard.Bound, so a newly added operation cannot
 // silently fall outside the deadline policy.
 func TestStructuredOperationMethodsCallDeadlineGuard(t *testing.T) {
 	t.Parallel()
@@ -44,9 +44,9 @@ func TestStructuredOperationMethodsCallDeadlineGuard(t *testing.T) {
 				continue
 			}
 			operations++
-			if !callsGuard(function.Body, "RequireDeadline") {
+			if !callsGuard(function.Body, "Bound") {
 				position := fileSet.Position(function.Pos())
-				t.Errorf("%s:%d %s does not call guard.RequireDeadline", path, position.Line, function.Name.Name)
+				t.Errorf("%s:%d %s does not call guard.Bound", path, position.Line, function.Name.Name)
 			}
 		}
 	}

@@ -18,6 +18,10 @@ import (
 type DeadlineRequiredError = guard.DeadlineRequiredError
 type NotImplementedError = guard.NotImplementedError
 
+// DefaultOperationTimeout bounds an operation whose context has no deadline
+// when Options.DefaultOperationTimeout is zero.
+const DefaultOperationTimeout = guard.DefaultOperationTimeout
+
 // Store bundles the four structured primitives. It deliberately is not a
 // storage.Composite, whose constructor requires a Blobs implementation.
 type Store struct {
@@ -32,16 +36,19 @@ type Store struct {
 
 var newPool = pgxpool.NewWithConfig
 
-// Open validates options, requires a caller deadline, creates the pool, and
-// applies or validates the configured schema migration policy before returning.
+// Open validates options, creates the pool, and applies or validates the
+// configured schema migration policy before returning. A context without a
+// deadline is bounded by Options.DefaultOperationTimeout.
 func Open(ctx context.Context, options Options) (*Store, error) {
 	resolved, err := options.resolve()
 	if err != nil {
 		return nil, err
 	}
-	if err := guard.RequireDeadline(ctx, "Open"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "Open", resolved.operationTimeout)
+	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	pool, err := newPool(ctx, resolved.poolConfig)
 	if err != nil {
 		// NewWithConfig validates already-parsed configuration. Do not expose its
@@ -52,12 +59,13 @@ func Open(ctx context.Context, options Options) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
-	leaseStore := lease.New(pool, resolved.schema, resolved.tablePrefix, resolved.leaseTTL, resolved.leaseRenewInterval, resolved.statementTimeout, resolved.lockTimeout)
+	leaseStore := lease.New(pool, resolved.schema, resolved.tablePrefix, resolved.leaseTTL, resolved.leaseRenewInterval, resolved.statementTimeout, resolved.lockTimeout).
+		WithOperationTimeout(resolved.operationTimeout)
 	return &Store{
-		Ledger:       ledger.New(pool, resolved.schema, resolved.tablePrefix, resolved.statementTimeout, resolved.lockTimeout),
+		Ledger:       ledger.New(pool, resolved.schema, resolved.tablePrefix, resolved.statementTimeout, resolved.lockTimeout).WithOperationTimeout(resolved.operationTimeout),
 		Leaser:       leaseStore,
-		KV:           kv.New(pool, resolved.schema, resolved.tablePrefix),
-		OrderedIndex: orderedindex.New(pool, resolved.schema, resolved.tablePrefix, resolved.statementTimeout, resolved.lockTimeout),
+		KV:           kv.New(pool, resolved.schema, resolved.tablePrefix).WithOperationTimeout(resolved.operationTimeout),
+		OrderedIndex: orderedindex.New(pool, resolved.schema, resolved.tablePrefix, resolved.statementTimeout, resolved.lockTimeout).WithOperationTimeout(resolved.operationTimeout),
 		closePool: func() {
 			leaseStore.Close()
 			pool.Close()

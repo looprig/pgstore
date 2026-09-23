@@ -28,6 +28,7 @@ const (
 )
 
 type Store struct {
+	operationTimeout time.Duration
 	pool             *pgxpool.Pool
 	schema           string
 	tablePrefix      string
@@ -41,13 +42,22 @@ func New(pool *pgxpool.Pool, schema, tablePrefix string, operationTimeouts ...ti
 	if len(operationTimeouts) == 2 {
 		statementTimeout, lockTimeout = operationTimeouts[0], operationTimeouts[1]
 	}
-	return &Store{pool: pool, schema: schema, tablePrefix: tablePrefix, statementTimeout: statementTimeout, lockTimeout: lockTimeout, commit: func(ctx context.Context, tx pgx.Tx) error { return tx.Commit(ctx) }}
+	return &Store{operationTimeout: guard.DefaultOperationTimeout, pool: pool, schema: schema, tablePrefix: tablePrefix, statementTimeout: statementTimeout, lockTimeout: lockTimeout, commit: func(ctx context.Context, tx pgx.Tx) error { return tx.Commit(ctx) }}
+}
+
+// WithOperationTimeout sets the bound applied to an operation whose context
+// has no deadline. It must be called before the Store is shared.
+func (s *Store) WithOperationTimeout(timeout time.Duration) *Store {
+	s.operationTimeout = timeout
+	return s
 }
 
 func (s *Store) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
-	if err := guard.RequireDeadline(ctx, "OrderedIndex.Get"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.Get", s.operationTimeout)
+	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
+	defer cancel()
 	if err := storage.ValidateOrderedID(id); err != nil {
 		return storage.OrderedRecord{}, err
 	}
@@ -62,9 +72,11 @@ func (s *Store) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedR
 }
 
 func (s *Store) Create(ctx context.Context, id storage.OrderedID, rankingScope string, value []byte, rank storage.Rank, due storage.Due) (storage.OrderedRecord, bool, error) {
-	if err := guard.RequireDeadline(ctx, "OrderedIndex.Create"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.Create", s.operationTimeout)
+	if err != nil {
 		return storage.OrderedRecord{}, false, err
 	}
+	defer cancel()
 	if err := storage.ValidateOrderedID(id); err != nil {
 		return storage.OrderedRecord{}, false, err
 	}
@@ -163,9 +175,11 @@ func (s *Store) createOnce(ctx context.Context, id storage.OrderedID, rankingSco
 }
 
 func (s *Store) Update(ctx context.Context, id storage.OrderedID, expectedRevision uint64, value []byte, rank storage.Rank, due storage.Due) (storage.OrderedRecord, error) {
-	if err := guard.RequireDeadline(ctx, "OrderedIndex.Update"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.Update", s.operationTimeout)
+	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
+	defer cancel()
 	if err := storage.ValidateOrderedID(id); err != nil {
 		return storage.OrderedRecord{}, err
 	}
@@ -241,9 +255,11 @@ func (s *Store) updateOnce(ctx context.Context, id storage.OrderedID, expectedRe
 }
 
 func (s *Store) Delete(ctx context.Context, id storage.OrderedID, expectedRevision uint64) (storage.OrderedRecord, error) {
-	if err := guard.RequireDeadline(ctx, "OrderedIndex.Delete"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.Delete", s.operationTimeout)
+	if err != nil {
 		return storage.OrderedRecord{}, err
 	}
+	defer cancel()
 	if err := storage.ValidateOrderedID(id); err != nil {
 		return storage.OrderedRecord{}, err
 	}
@@ -311,9 +327,11 @@ func (s *Store) deleteOnce(ctx context.Context, id storage.OrderedID, expectedRe
 }
 
 func (s *Store) ListOrdered(ctx context.Context, namespace, orderingScope string, afterOrder uint64, limit int) (storage.OrderedPage, error) {
-	if err := guard.RequireDeadline(ctx, "OrderedIndex.ListOrdered"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.ListOrdered", s.operationTimeout)
+	if err != nil {
 		return storage.OrderedPage{}, err
 	}
+	defer cancel()
 	if err := storage.ValidateName(namespace); err != nil {
 		return storage.OrderedPage{}, err
 	}
@@ -340,9 +358,11 @@ func (s *Store) ListOrdered(ctx context.Context, namespace, orderingScope string
 }
 
 func (s *Store) ListRanked(ctx context.Context, namespace, rankingScope string, after storage.RankedCursor, limit int) (storage.RankedPage, error) {
-	if err := guard.RequireDeadline(ctx, "OrderedIndex.ListRanked"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.ListRanked", s.operationTimeout)
+	if err != nil {
 		return storage.RankedPage{}, err
 	}
+	defer cancel()
 	if err := storage.ValidateName(namespace); err != nil {
 		return storage.RankedPage{}, err
 	}
@@ -380,9 +400,11 @@ func (s *Store) ListRanked(ctx context.Context, namespace, rankingScope string, 
 }
 
 func (s *Store) ListDue(ctx context.Context, namespace string, dueAtOrBefore int64, after storage.DueCursor, limit int) (storage.DuePage, error) {
-	if err := guard.RequireDeadline(ctx, "OrderedIndex.ListDue"); err != nil {
+	ctx, cancel, err := guard.Bound(ctx, "OrderedIndex.ListDue", s.operationTimeout)
+	if err != nil {
 		return storage.DuePage{}, err
 	}
+	defer cancel()
 	if err := storage.ValidateName(namespace); err != nil {
 		return storage.DuePage{}, err
 	}
