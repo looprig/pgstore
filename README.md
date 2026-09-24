@@ -5,6 +5,21 @@ primitives: **Ledger**, **Leaser**, **KV**, and **OrderedIndex**. It intentional
 does not implement `storage.Blobs`; a cloud composition combines these fields
 with the S3-compatible blob provider from `s3store`.
 
+The structured primitives conform to the `github.com/looprig/storage` v0.7.0
+contract, including its nested-name KV cases (a key and a key extending it with
+`/…` coexist). `Open` returns a `*pgstore.Store` with `Ledger`, `Leaser`, `KV` and
+`OrderedIndex` fields; it is deliberately not a `storage.Composite`, because that
+constructor requires a Blobs implementation.
+
+## Install
+
+```sh
+go get github.com/looprig/pgstore@latest
+```
+
+It sits in tier 1 of the Looprig graph (foundation adapters); its only Looprig
+dependency is `github.com/looprig/storage`.
+
 Ledger, KV, renewable transactional epoch leases, and OrderedIndex are implemented over
 PostgreSQL. `Open` applies, validates, or bypasses schema version `0003`
 according to `Options.Migrations`; apply mode serializes owners under an
@@ -58,8 +73,8 @@ transactions apply timeouts with transaction-local settings.
 The Storage contract does not require a caller to put a deadline on its
 context, and SessionStore's consumers do not (Host opens its store on
 `context.WithoutCancel`). v0.1.x refused every such call with
-`DeadlineRequiredError`, so no Host could run on this backend. This release
-bounds it instead: `Open` and every Ledger, Leaser, `Lease.Release`, KV, and
+`DeadlineRequiredError`, so no Host could run on this backend. Since v0.2.0 such
+a call is bounded instead: `Open` and every Ledger, Leaser, `Lease.Release`, KV, and
 OrderedIndex operation runs under `Options.DefaultOperationTimeout` (default
 `DefaultOperationTimeout`, 30s) when the context has no deadline. A caller's own
 deadline always wins, shorter or longer; the default is a child of the caller's
@@ -109,9 +124,12 @@ to guarantee it is to have no logging path at all.
 
 ## Development
 
+The baseline is Go 1.26.8. Verify the module standalone, never against a workspace:
+
 ```sh
-make check
 GOWORK=off go test ./...
+make check              # fmt-check, vet, staticcheck, gosec, govulncheck, race tests, build
+make test-integration   # GOWORK=off go test -tags integration -race ./... (needs PGSTORE_TEST_DSN)
 ```
 
 Operational documentation lives in [`docs/OPERATIONS.md`](docs/OPERATIONS.md);
@@ -126,3 +144,7 @@ bytewise-collating database, where `TestKVKeysPinsBytewiseCollation` is the
 guard that still holds. Ledger/KV/Leaser/OrderedIndex conformance, transaction races, migration
 ownership, cancellation, and ambiguous-commit tests require a disposable
 PostgreSQL database.
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE).
