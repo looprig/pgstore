@@ -26,7 +26,7 @@ gosec:
 
 vuln:
 	GOWORK=off go mod verify
-	GOWORK=off go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+	GOWORK=off go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
 secure: fmt-check vet staticcheck gosec vuln
 
